@@ -1,0 +1,11 @@
+from .bcg_output_patch import patch_bcg_output_types
+from .breakable_patch import patch_breakable_replay
+from .async_copy_patch import patch_maybe_collect_async_copy
+from .prefill_trim_patch import patch_prefill_trim_customized_info
+from .forward_cadence_patch import patch_forward_guard_cadence
+
+patch_bcg_output_types()
+patch_breakable_replay()
+patch_maybe_collect_async_copy()
+patch_prefill_trim_customized_info()
+patch_forward_guard_cadence()

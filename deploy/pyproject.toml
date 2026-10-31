@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pguard-sglang"
+version = "0.1.2"
+description = "PGuard safety-head integration for SGLang"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+dependencies = [
+    "torch",
+    "transformers",
+    "safetensors",
+]
+
+[project.optional-dependencies]
+sglang0511 = ["sglang==0.5.11"]
+sglang0517 = ["sglang==0.5.17"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["pguard", "pguard.*"]
+
+[tool.pguard.source]
+branch = "integration/pguard-three-models"
+commit = "5e0c97888a2b5c6717cb62eb203b3cfd3f12b6b8"

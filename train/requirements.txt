@@ -1,0 +1,17 @@
+torch
+accelerate
+huggingface_hub
+pillow>=10.1.0
+numpy==1.26.4
+tqdm
+requests
+
+transformers==5.2.0
+datasets==4.2.0.*
+pyarrow==21.0.0
+trl==0.23.1
+mistral-common==1.9.1
+
+orjson
+IPython
+sglang==0.5.10
