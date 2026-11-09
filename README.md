@@ -106,12 +106,14 @@ Training and serving support are listed separately.
 ## Citation
 
 ```bibtex
-@techreport{aaig2026pguard,
-  title       = {PGuard: A Native, Streaming, and Plug-in Guardrail for Multimodal Large Language Models},
-  author      = {{Alibaba AAIG}},
-  institution = {Alibaba AAIG},
-  year        = {2026},
-  month       = oct
+@article{lin2026pguardnativestreamingplugin,
+      title={PGuard: A Native, Streaming, and Plug-in Guardrail for Multimodal Large Language Models}, 
+      author={Junyu Lin and Mengjie Wu and Yonghao Dong and Yuchuan Fu and Jinfeng Li and Xiaodan Li and Xiaohan Yuan and Yicheng Liu and Yuefeng Chen and Hui Xue and Jingyi Wang and Yitong Yang and Jiyuan Fu and Qiang He},
+      year={2026},
+      eprint={2611.02791},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2611.02791}, 
 }
 ```
 
