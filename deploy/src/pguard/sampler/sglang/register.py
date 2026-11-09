@@ -1,4 +1,6 @@
 import logging
+import os
+from functools import partial
 from sglang.srt.layers.sampler import Sampler, register_sampler_backend
 import torch
 from typing import TYPE_CHECKING, List
@@ -15,6 +17,7 @@ from pguard.config import (
 from pguard.patches import guard_variant
 from pguard.patches import async_copy_patch
 from pguard.patches.async_copy_patch import PendingGuardCopy
+from pguard_server_plugin import POLICY_ENV
 
 logger = logging.getLogger(__name__)
 
@@ -63,15 +66,16 @@ def customized_info_to_cpu(customized_info: dict, need_copy=True, batch_size=Non
     return final_customized_info
 
 
-def customized_info_to_async(customized_info: dict, batch_size=None):
+def customized_info_to_async(customized_info: dict, batch_size=None, pending_copy=PendingGuardCopy):
     if customized_info is None:
         return None
     final_customized_info = {}
 
-    def prepare_tensor(tensor):
+    def prepare_tensor(tensor, key):
         if not tensor.is_cuda:
             return tensor.to("cpu").tolist()
-        return PendingGuardCopy(tensor)
+        factory = pending_copy if key == "guard_logits" else PendingGuardCopy
+        return factory(tensor)
 
     for key, value in customized_info.items():
         if not isinstance(value, (torch.Tensor, list)):
@@ -85,10 +89,10 @@ def customized_info_to_async(customized_info: dict, batch_size=None):
                 )
                 continue
         if isinstance(value, torch.Tensor):
-            final_customized_info[key] = prepare_tensor(value)
+            final_customized_info[key] = prepare_tensor(value, key)
         else:
             final_customized_info[key] = [
-                prepare_tensor(item) if isinstance(item, torch.Tensor) else item
+                prepare_tensor(item, key) if isinstance(item, torch.Tensor) else item
                 for item in value
             ]
     return final_customized_info
@@ -99,6 +103,20 @@ class CustomSampler(Sampler):
         super().__init__()
         self.is_guard_overwrite_model = PGUARD_OVERWRITE_MODEL
         self.async_copy = _ASYNC_COPY and async_copy_patch.installed()
+        self.copy_to_cpu = customized_info_to_cpu
+        self.copy_to_async = customized_info_to_async
+        if os.getenv(POLICY_ENV):
+            from pguard.interrupt_runtime import (
+                copy_with_guard_cpu,
+                install_interrupt,
+                interrupt_pending_copy_class,
+            )
+
+            install_interrupt()
+            self.copy_to_cpu = partial(copy_with_guard_cpu, customized_info_to_cpu)
+            self.copy_to_async = partial(
+                customized_info_to_async, pending_copy=interrupt_pending_copy_class()
+            )
 
     def forward(
         self,
@@ -123,11 +141,11 @@ class CustomSampler(Sampler):
             need_copy = guard_variant.consume_decision()
             customized_info = logits_output.customized_info
             if self.async_copy and need_copy:
-                logits_output.customized_info = customized_info_to_async(
+                logits_output.customized_info = self.copy_to_async(
                     customized_info, batch_size=batch_size
                 )
             else:
-                logits_output.customized_info = customized_info_to_cpu(
+                logits_output.customized_info = self.copy_to_cpu(
                     customized_info, need_copy=need_copy, batch_size=batch_size
                 )
             contain_guard_logits = "guard_logits" not in logits_output.customized_info

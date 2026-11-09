@@ -2,7 +2,7 @@
 
 PGuard serves a trained safety head on top of a frozen backbone inside
 [SGLang](https://github.com/sgl-project/sglang). The head consumes hidden states
-captured from a few selected backbone layers and emits per-class risk logits
+captured from a few selected backbone layers and emits per-class risk scores
 alongside the generated tokens, so scoring costs no extra forward pass and adds
 no extra request.
 
@@ -17,8 +17,7 @@ pip install -e '.[sglang0517]'
 
 ### Serving
 
-The package registers its models through SGLang's external-model hook, so the
-launch command stays the stock one and only the environment changes:
+The package registers its models through SGLang's external-model hook:
 
 ```bash
 export SGLANG_EXTERNAL_MODEL_PACKAGE=pguard.sglang
@@ -33,11 +32,22 @@ python -m sglang.launch_server \
     --incremental-streaming-output
 ```
 
+### Interrupt policy (Optional)
+
+Add `--interrupt_config /path/to/policy.json` to stop a request when a scored
+category exceeds its threshold. Rules are stage-specific:
+
+```json
+[
+  "prefill.Crimes & Illegal Activities###Dangerous Weapons@0.9",
+  "decode.Crimes & Illegal Activities###Dangerous Weapons@0.95"
+]
+```
+
 ### Consuming the scores
 
-Risk logits ride along the normal response under `meta_info.guard_logits`. It
-holds one entry per token carried by that chunk — a `num_classes` vector on a
-scoring step, the scalar `0.0` on a non-scoring one:
+Per-head softmax scores are returned in `meta_info.guard_logits`.
+Each token has a class-score vector on scoring steps, or `0.0` otherwise.
 
 ```python
 chunk["meta_info"]["guard_logits"]   # [[v1, ..., vC]] scored this token
@@ -83,6 +93,7 @@ Common:
 |---|---|---|
 | `PGUARD_EMA_SCALES` | `200,150,100,50` | EMA window lengths in tokens |
 | `PGUARD_PREFILL_SCORE_PROB` | `1.0` | Ratio of scoring |
+| `PGUARD_PREFILL_RISK_MODE` | `last` | `last`: final position; `all`: per-class max over scored positions, without renormalization |
 | `PGUARD_MAX_REQ` | `256` | History buffer fallback size |
 
 `cfc`:

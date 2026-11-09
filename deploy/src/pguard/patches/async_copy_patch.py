@@ -76,13 +76,16 @@ class PendingGuardCopy:
         self.stream = None
         self._discarded = True
 
+    def _materialize(self):
+        return self.pinned.tolist()
+
     def resolve(self):
         if self._values is not None:
             return self._values
         if self._discarded or self._retired_copy:
             raise RuntimeError("discarded guard copy cannot be resolved")
         self.event.synchronize()
-        self._values = self.pinned.tolist()
+        self._values = self._materialize()
         self._release_buffer()
         self.source = None
         self.event = None

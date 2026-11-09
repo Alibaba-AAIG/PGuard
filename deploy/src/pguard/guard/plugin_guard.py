@@ -215,7 +215,7 @@ class PluginGuard(nn.Module):
         return features
 
     def _classify_unfused(self, features: torch.Tensor) -> torch.Tensor:
-        return torch.cat([head(features) for head in self.classifiers], dim=-1)
+        return torch.cat([torch.softmax(head(features), dim=-1) for head in self.classifiers], dim=-1)
 
     def _build_classifier_fused(self) -> None:
         heads = list(self.classifiers)
@@ -244,7 +244,7 @@ class PluginGuard(nn.Module):
         ).permute(1, 0, 2)
         logits = torch.bmm(hidden, out_weight.transpose(1, 2)) + out_bias[:, None, :]
         pieces = [
-            logits[index, :, :num_classes]
+            torch.softmax(logits[index, :, :num_classes], dim=-1)
             for index, (_, num_classes) in enumerate(self.classification_heads)
         ]
         return torch.cat(pieces, dim=-1).view(*shape[:-1], -1)

@@ -701,8 +701,8 @@ class CfcPluginGuard(nn.Module):
 
     def _classify(self, features: torch.Tensor) -> torch.Tensor:
         if len(self.classifiers) == 1:
-            return self.classifiers[0](features)
-        return torch.cat([head(features) for head in self.classifiers], dim=-1)
+            return torch.softmax(self.classifiers[0](features), dim=-1)
+        return torch.cat([torch.softmax(head(features), dim=-1) for head in self.classifiers], dim=-1)
 
     def score(self, h: torch.Tensor, cfc_input: torch.Tensor) -> torch.Tensor:
         features = h + self.skip_proj(cfc_input)

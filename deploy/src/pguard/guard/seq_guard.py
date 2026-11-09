@@ -819,7 +819,7 @@ class SequencePluginGuard(nn.Module):
         return self._classify_unfused(h)
 
     def _classify_unfused(self, h: torch.Tensor) -> torch.Tensor:
-        return torch.cat([head(h) for head in self.classifiers], dim=-1)
+        return torch.cat([torch.softmax(head(h), dim=-1) for head in self.classifiers], dim=-1)
 
     @torch.no_grad()
     def _classifiers_forward_fused(self, h: torch.Tensor) -> torch.Tensor:
@@ -837,7 +837,9 @@ class SequencePluginGuard(nn.Module):
         dense_w, dense_b, output_w, output_b = self._classifiers_fused
         first_head = next(iter(self.classifiers))
         hidden = first_head.act_fn(F.linear(h, dense_w, dense_b))
-        return F.linear(hidden, output_w, output_b)
+        logits = F.linear(hidden, output_w, output_b)
+        pieces = logits.split([head.out_proj.out_features for head in self.classifiers], dim=-1)
+        return torch.cat([torch.softmax(piece, dim=-1) for piece in pieces], dim=-1)
 
 
     def _fusion_forward(

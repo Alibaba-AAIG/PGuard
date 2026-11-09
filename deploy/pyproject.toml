@@ -13,11 +13,19 @@ dependencies = [
     "torch",
     "transformers",
     "safetensors",
+    "numpy",
 ]
 
 [project.optional-dependencies]
 sglang0511 = ["sglang==0.5.11"]
 sglang0517 = ["sglang==0.5.17"]
+
+[project.entry-points."sglang.srt.plugins"]
+pguard_interrupt = "pguard_server_plugin:load"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["pguard_server_plugin"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
