@@ -1,0 +1,12 @@
+# PGuard-enabled vLLM 服务镜像（vLLM v0.34.0）
+# 构建上下文 = PGuard/ 根目录
+#
+# 与 vllm/vllm-openai:v0.34.0 同版本；补丁包通过 vllm.general_plugins
+# entry point 注册自定义架构，不改动 vLLM 源码。
+FROM vllm/vllm-openai:v0.34.0
+
+COPY pguard_vllm /opt/pguard_vllm
+RUN pip install --no-cache-dir /opt/pguard_vllm
+
+# 引擎与 API 同进程，GuardStore 直接可读（pguard_vllm.server 也会强制设置）
+ENV VLLM_ENABLE_V1_MULTIPROCESSING=0
