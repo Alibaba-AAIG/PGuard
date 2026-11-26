@@ -64,6 +64,7 @@
 - 请求体 = 标准 OpenAI Chat 格式（messages / temperature / max_tokens / stream …）。
 - 非流式：响应 JSON 在标准字段外追加 `guard_result`。
 - 流式：每个 chunk 仍是标准 delta；**最后一个 data chunk** 追加 `guard_result` 字段，再发 `[DONE]`。
+- 流式中断（`guard_interrupt`）：每个 chunk 检查一次引擎维护的**实时状态文件**（每个请求一个小文件：prompt 侧最终结论 + 输出侧累计最大值，只在最高非 normal 概率上升时重写）。不能改成只读分数文件的最后一条记录——prompt 的记录后面只要跟上一条正常的输出记录，prompt 侧命中就会被盖住。
 - `guard_result` 内容：
   ```json
   {

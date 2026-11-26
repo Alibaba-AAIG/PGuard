@@ -71,6 +71,19 @@ def _find_path(store_dir: str, head: str, req_id: str) -> str | None:
     return matches[0] if matches else None
 
 
+def _live_path(store_dir: str, req_id: str) -> str:
+    # suffix differs from the score files so _find_path's glob never sees it
+    return os.path.join(store_dir, f"live__{req_id}.live")
+
+
+def _find_live_path(store_dir: str, req_id: str) -> str | None:
+    exact = _live_path(store_dir, req_id)
+    if os.path.exists(exact):
+        return exact
+    matches = sorted(glob.glob(_live_path(store_dir, req_id + "*")))
+    return matches[0] if matches else None
+
+
 class GuardStore:
     """File-backed per-(head, request) score store shared across processes."""
 
@@ -83,6 +96,7 @@ class GuardStore:
         # engine-side fd cache: one open per (head, request) for its whole
         # lifetime instead of open/close on every scored step
         self._fds = {}
+        self._live_fds = {}   # request id -> fd of its live status file
 
     def schema(self, head: str):
         if head not in self._schemas:
@@ -171,6 +185,25 @@ class GuardStore:
             except OSError:
                 pass
         self._fds.clear()
+        for req_id in list(self._live_fds):
+            self.close_live(req_id)
+
+    # -- live status (streaming interrupt check) ---------------------------
+    def write_live(self, req_id: str, status: dict) -> None:
+        """Rewrite one request's live status in place (engine side):
+        {head: {"plast": [...], "dmax": [...]}} -- the last prompt token's
+        class vector and the running max over scored output tokens, or None
+        while that stage has nothing scored yet. The API reads this single
+        small file per streamed chunk, so a prompt-side hit stays visible no
+        matter how many output records follow it."""
+        data = (json.dumps(status, separators=(",", ":")) + "\n").encode()
+        fd = self._live_fds.get(req_id)
+        if fd is None:
+            fd = os.open(_live_path(self.store_dir, req_id),
+                         os.O_WRONLY | os.O_CREAT, 0o644)
+            self._live_fds[req_id] = fd
+        os.pwrite(fd, data, 0)
+        os.ftruncate(fd, len(data))
 
     def exists(self, head: str, req_id: str) -> bool:
         """Cheap finished-check for the engine hot path: append() always
@@ -201,24 +234,36 @@ class GuardStore:
         except FileNotFoundError:
             return None
 
-    def latest(self, head: str, req_id: str):
-        """Last scored record {'s': stage, 'p': [[cls...], ...]} or None.
-        Cheap per-chunk read for streaming interrupt checks."""
-        path = _find_path(self.store_dir, head, req_id)
+    def close_live(self, req_id: str) -> None:
+        """Drop the engine-side fd of a request's live status file."""
+        fd = self._live_fds.pop(req_id, None)
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def read_live(self, req_id: str) -> dict | None:
+        """Latest live status of a request (api side), or None when it has
+        not been written yet or a rewrite was caught mid-flight."""
+        path = _find_live_path(self.store_dir, req_id)
         if path is None:
             return None
         try:
-            with open(path, 'rb') as f:
-                f.seek(0, os.SEEK_END)
-                size = f.tell()
-                f.seek(max(0, size - 4096))
-                lines = f.read().decode().strip().split('\n')
-            for line in reversed(lines):
-                if line.strip():
-                    return json.loads(line)
-        except (FileNotFoundError, json.JSONDecodeError):
+            with open(path, "rb") as f:
+                return json.loads(f.read())
+        except (OSError, json.JSONDecodeError):
             return None
-        return None
+
+    def clear_live(self, req_id: str) -> None:
+        """Unlink a request's live status file (api side, once finalized)."""
+        self.close_live(req_id)
+        path = _find_live_path(self.store_dir, req_id)
+        if path is not None:
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
 
     def flat_to_rows(self, head: str, n: int, flat):
         """Convert a step's flat task-major vector ([task0 tok0..tokN |
@@ -352,8 +397,10 @@ class GuardStore:
         """Consume every head's score file for a request (error cleanup)."""
         for head in self.heads:
             self.pop(head, req_id)
+        self.clear_live(req_id)
 
     def cleanup_all(self) -> None:
+        self.close_all_fds()
         shutil.rmtree(self.store_dir, ignore_errors=True)
         os.makedirs(self.store_dir, exist_ok=True)
 
@@ -432,4 +479,22 @@ if __name__ == "__main__":
     assert abs(agg2["prompt_scores"]["task_a"]["bad"] - 0.6) < 1e-6
     assert abs(agg2["response_scores_last"]["task_b"]["y"] - 0.3) < 1e-6
     assert abs(agg2["response_scores_max"]["task_b"]["x"] - 0.9) < 1e-6
-    print("store self-test OK (multi-head, flat records, final record, cross-process)")
+
+    # live status: the engine rewrites one small file per request and the api
+    # reads it whole; a shorter rewrite must not leave stale bytes behind
+    live = {"ema": {"plast": [0.4, 0.6, 0.5, 0.3, 0.2],
+                    "dmax": [0.1, 0.0, 0.1, 0.2, 0.05]}}
+    assert reader.read_live("r3") is None                 # nothing written yet
+    writer.write_live("r3", live)
+    assert reader.read_live("r3") == live
+    short = {"ema": {"plast": [0.4, 0.6, 0.5, 0.3, 0.2], "dmax": None}}
+    writer.write_live("r3", short)                        # shorter than before
+    assert reader.read_live("r3") == short
+    writer.append("ema", "r3", prefill_flat, 1, is_decode=False)
+    reader.pop_all("r3")                                  # error-cleanup path
+    assert reader.read_live("r3") is None                 # live file gone too
+    writer.write_live("r4", live)
+    reader.clear_live("r4")
+    assert reader.read_live("r4") is None
+    print("store self-test OK (multi-head, flat records, final record, "
+          "live status, cross-process)")

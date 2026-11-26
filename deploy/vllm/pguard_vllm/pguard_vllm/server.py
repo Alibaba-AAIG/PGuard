@@ -82,6 +82,7 @@ def build_guard_result(req_id: str, include_series: bool = False,
         agg["threshold"] = threshold
         agg["head"] = head
         results[head] = agg
+    store.clear_live(req_id)   # live status only serves the streaming check
     if not results:
         return None
     first = next(iter(results))
@@ -142,33 +143,42 @@ def _summarize_guard(store, heads: list[str], threshold: float,
             "threshold": threshold}
 
 
+def _flat_task_scores(store, head: str, vec) -> dict:
+    """Flat class vector (global class order) -> {task: {non-normal label: p}}."""
+    _, id2label = store.schema(head)
+    layout, _ = store.task_layout(head)
+    task_scores = {}
+    for task, start, stop in layout:
+        labels = id2label.get(task, {})
+        task_scores[task] = {
+            labels.get(str(i - start), str(i - start)): vec[i]
+            for i in range(start, stop)
+            if labels.get(str(i - start), str(i - start)) != "normal"}
+    return task_scores
+
+
 def _latest_slim(store, heads: list[str], threshold: float,
                  req_id: str) -> dict | None:
-    """Slim summary from the newest scored step of each head (streaming)."""
-    best = None
+    """Slim summary from a request's live status (streaming): per head the
+    final prompt-side vector plus the running max over scored output tokens.
+    The engine rewrites that one small file each step; reading it whole keeps
+    a prompt-side hit visible no matter how many output records follow it."""
+    live = store.read_live(req_id)
+    if not live:
+        return None
+    best = None  # (score, task, label, stage, head)
     for head in heads:
-        rec = store.latest(head, req_id)
-        if rec is None:
+        one = live.get(head)
+        if not one:
             continue
-        stage = "prompt" if rec.get("s") == "prefill" else "response"
-        flat = rec.get("p") or []
-        n = int(rec.get("n") or 0)
-        rows = store.flat_to_rows(head, n, flat)
-        layout, _ = store.task_layout(head)
-        _, id2label = store.schema(head)
-        task_scores = {}
-        for task, start, stop in layout:
-            labels = id2label.get(task, {})
-            scores = {}
-            for row in rows:
-                for i in range(start, stop):
-                    lbl = labels.get(str(i - start), str(i - start))
-                    if lbl != "normal" and row[i] > scores.get(lbl, -1):
-                        scores[lbl] = row[i]
-            task_scores[task] = scores
-        hit = _max_violation(head, task_scores, threshold)
-        if hit and (best is None or hit[0] > best[0]):
-            best = (hit[0], hit[1], hit[2], stage, head)
+        for stage, key in (("prompt", "plast"), ("response", "dmax")):
+            vec = one.get(key)
+            if not vec:
+                continue
+            hit = _max_violation(head, _flat_task_scores(store, head, vec),
+                                 threshold)
+            if hit and (best is None or hit[0] > best[0]):
+                best = (hit[0], hit[1], hit[2], stage, head)
     if best is None:
         return None
     score, task, label, stage, head = best
@@ -191,6 +201,7 @@ def _finalize_guard(req_id: str, threshold: float, verbose: bool,
             agg["head"] = head
             agg["risk"] = store.risk_flags(head, agg, threshold)
             agg_by_head[head] = agg
+    store.clear_live(req_id)   # live status only serves the streaming check
     if not agg_by_head:
         return None
     slim = _summarize_guard(store, heads, threshold, agg_by_head)
@@ -396,12 +407,69 @@ def _ensure_plugin_installed() -> None:
     logger.info("pguard_vllm: installed editable distribution from %s", src)
 
 
+def _self_test() -> int:
+    """Streaming-interrupt check against a real store (no engine needed):
+    python3 -m pguard_vllm.server --self-test"""
+    import tempfile
+    from .store import GuardStore
+
+    tmp = tempfile.mkdtemp()
+    schema = {
+        "classifier": {"classification_heads": [["task_a", 2], ["task_b", 3]]},
+        "task_schema": {
+            "task_a": {"id2label": {"0": "normal", "1": "bad"}, "task_id": 0},
+            "task_b": {"id2label": {"0": "normal", "1": "x", "2": "y"}, "task_id": 1},
+        },
+    }
+    head_dir = os.path.join(tmp, "ema")
+    os.makedirs(head_dir)
+    with open(os.path.join(head_dir, "config.json"), "w") as f:
+        json.dump(schema, f)
+    store_dir = os.path.join(tmp, "store")
+    engine = GuardStore({"ema": head_dir}, store_dir=store_dir)   # writer
+    api = GuardStore({"ema": head_dir}, store_dir=store_dir)      # reader
+    heads = ["ema"]
+    benign = [0.9, 0.1, 0.8, 0.1, 0.1]
+
+    def check(label, expect, req_id="r1"):
+        hit = _latest_slim(api, heads, 0.5, req_id)
+        got = None if hit is None else (hit["score"], hit["stage"], hit["category"])
+        print("  %-44s -> %s" % (label, got if got == expect
+                                 else "UNEXPECTED %r" % (got,)))
+        return 0 if got == expect else 1
+
+    bad = 0
+    # risky prompt (task_a bad = 0.6) whose output tokens are all normal
+    plast = [0.4, 0.6, 0.5, 0.3, 0.2]
+    engine.append("ema", "r1", plast, 1, is_decode=False)
+    engine.write_live("r1", {"ema": {"plast": plast, "dmax": None}})
+    bad += check("prompt hit, nothing after it", (0.6, "prompt", "task_a / bad"))
+    engine.append("ema", "r1", benign, 1, is_decode=True)
+    bad += check("prompt hit + 1 normal output record",
+                 (0.6, "prompt", "task_a / bad"))
+    engine.append("ema", "r1", benign, 1, is_decode=True)
+    bad += check("prompt hit + 2 normal output records",
+                 (0.6, "prompt", "task_a / bad"))
+    # a stronger output-side hit outranks the prompt one (task_b x = 0.9)
+    engine.write_live("r1", {"ema": {"plast": plast,
+                                     "dmax": [0.1, 0.0, 0.1, 0.9, 0.05]}})
+    bad += check("prompt hit + stronger response hit",
+                 (0.9, "response", "task_b / x"))
+    engine.write_live("r1", {"ema": {"plast": benign, "dmax": benign}})
+    bad += check("clean prompt + clean output", None)
+    bad += check("request never scored", None, req_id="nope")
+    api.pop_all("r1")
+    bad += check("after pop_all", None)
+    print("server self-test (streaming interrupt):",
+          "FAILED (%d)" % bad if bad else "ok")
+    return 1 if bad else 0
+
+
 def main():
-    _ensure_plugin_installed()
-    from .store import get_store
-    get_store().cleanup_all()   # drop stale score files from previous runs
     parser = argparse.ArgumentParser(description="pguard-vllm server")
-    parser.add_argument("--model", required=True)
+    parser.add_argument("--self-test", action="store_true",
+                        help="run the streaming-interrupt self-test and exit")
+    parser.add_argument("--model")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--served-model-name", default="pguard-backbone")
@@ -409,6 +477,13 @@ def main():
                         default=float(os.environ.get("PGUARD_THRESHOLD", "0.5")))
     parser.add_argument("--head-path", default=os.environ.get("PGUARD_HEAD_PATH"))
     args, remaining = parser.parse_known_args()
+    if args.self_test:
+        raise SystemExit(_self_test())
+    if not args.model:
+        parser.error("--model is required")
+    _ensure_plugin_installed()
+    from .store import get_store
+    get_store().cleanup_all()   # drop stale score files from previous runs
 
     engine_args = AsyncEngineArgs(model=args.model)
     if remaining:

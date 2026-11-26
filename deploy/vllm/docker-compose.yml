@@ -22,6 +22,9 @@ services:
       - PGUARD_ENFORCE_EAGER=${PGUARD_ENFORCE_EAGER:-0}
       - PGUARD_CAPTURE_MODE=${PGUARD_CAPTURE_MODE:-aux}
       - VLLM_USE_V2_MODEL_RUNNER=${VLLM_USE_V2_MODEL_RUNNER:-1}
+      # scoring cadence: 1.0 = every output token; 0.1 = every 10th
+      - PGUARD_COPY_LOGITS_PROB=${PGUARD_COPY_LOGITS_PROB:-1.0}
+      - PGUARD_SCORE_INTERVAL=${PGUARD_SCORE_INTERVAL:-}
       - PYTHONPATH=/opt/pguard_vllm
     volumes:
       - ${HOST_BACKBONE_DIR:?set HOST_BACKBONE_DIR to the backbone weights}:/models/backbone:ro

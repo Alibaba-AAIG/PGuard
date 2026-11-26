@@ -10,7 +10,9 @@ through vLLM's `vllm.general_plugins` entry point.
 
 Verified with Qwen3.5-9B (FP8-dynamic) on a single RTX 4090 24G: three heads
 online, 8-way concurrency at **328~350 tok/s** (pure-backbone eager baseline:
-169~210 tok/s), standalone moderation round-trip ~64 ms.
+169~210 tok/s), standalone moderation round-trip ~64 ms. With scoring thinned
+to every 10th output token (`PGUARD_COPY_LOGITS_PROB=0.1`) the same setup
+reaches **463~468 tok/s**.
 
 ## Install
 
@@ -44,7 +46,9 @@ Or via Docker Compose (see `docker-compose.yml`).
 
 - `POST /v1/chat/completions` -- OpenAI-compatible generation; non-stream
   responses carry `guard_result`, and `"stream": true, "guard_interrupt": true`
-  aborts as soon as a scored category crosses the threshold.
+  aborts as soon as a scored category crosses the threshold. A prompt-side
+  hit stops the stream before any content chunk is emitted (verified 30/30
+  trials on jailbreak-style prompts).
 - `POST /v1/guard/score` -- standalone moderation of a message list (no
   generation), ~64 ms round-trip.
 - `GET /v1/models`, `GET /health`.
@@ -65,7 +69,10 @@ Or via Docker Compose (see `docker-compose.yml`).
    task-major score records.
 4. Scores land in a file-backed store; the API aggregates them (running
    max/last maintained on the GPU, finalized once per request) and attaches
-   `guard_result` to responses.
+   `guard_result` to responses. The engine also keeps a tiny per-request
+   live status file (final prompt verdict + running response max) that the
+   streaming interrupt check reads, so later output records never mask a
+   prompt-side hit.
 
 See `DESIGN.md` for the vLLM-internals facts this relies on.
 
@@ -79,7 +86,7 @@ See `DESIGN.md` for the vLLM-internals facts this relies on.
 | `PGUARD_ENFORCE_EAGER` | `0` | `1` disables CUDA graphs (hooks mode requires eager) |
 | `PGUARD_CAPTURE_MODE` | `aux` | `aux` (graph-safe) or `hooks` (eager only) |
 | `VLLM_USE_V2_MODEL_RUNNER` | `1` | use the V2 GPU model runner |
-| `PGUARD_COPY_LOGITS_PROB` | `1.0` | scoring cadence; `0.1` scores every 10th decode step |
+| `PGUARD_COPY_LOGITS_PROB` | `1.0` | scoring cadence; `0.1` scores every 10th output token (prefill always scores) |
 | `PGUARD_SCORE_INTERVAL` | -- | scoring interval in steps (overrides the ratio) |
 | `PGUARD_PREFILL_RISK_MODE` | `all` | `all` scores every prefill token; `last` scores the final token only |
 | `PGUARD_HEAD_DTYPE` | `fp32` | head compute dtype (`bf16` halves head bandwidth) |
@@ -94,10 +101,19 @@ See `DESIGN.md` for the vLLM-internals facts this relies on.
 # module self-tests
 python3 -m pguard_vllm.store
 python3 -m pguard_vllm.state_pool
-python3 -m pguard_vllm.head        # needs PGUARD_PW_DIR pointing at checkpoints
+python3 -m pguard_vllm.model        # scoring-cadence dispatch
+python3 -m pguard_vllm.server --self-test   # streaming interrupt check
+python3 -m pguard_vllm.head         # needs PGUARD_PW_DIR pointing at checkpoints
 
 # end-to-end verdict cases
 bash pguard_smoke_test.sh 13553
+
+# streaming interruption: risky prompts stop with zero content chunks,
+# benign prompts finish normally
+python3 pguard_interrupt_e2e.py http://127.0.0.1:13553 10
+
+# late-arriving prompts keep their prompt-side scores under scoring cadence
+python3 pguard_cadence_e2e.py http://127.0.0.1:13553 16
 
 # concurrency benchmark
 python3 bench_guard.py http://127.0.0.1:13553 8
@@ -112,4 +128,8 @@ python3 bench_guard.py http://127.0.0.1:13553 8
    on business samples. The GRU head is the least discriminative under FP8.
 4. The EMA head's prompt series is per-prefill-chunk (last token); per-token
    series for EMA requires the sampled-EMA kernel (planned).
-5. Text input verified; multimodal inputs are not covered yet.
+5. With `PGUARD_COPY_LOGITS_PROB` < 1 only 1/N output tokens are scored:
+   `response_scores_max` covers scored tokens only, and a response-side
+   streaming interrupt can trail by up to N-1 tokens (the prompt side is
+   unaffected).
+6. Text input verified; multimodal inputs are not covered yet.
