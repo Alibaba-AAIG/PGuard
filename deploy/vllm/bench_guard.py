@@ -46,23 +46,28 @@ def run_concurrent(n):
 def run_stream_ttft():
     body = json.dumps({"model": "pguard-backbone",
                        "messages": [{"role": "user", "content": "写一篇300字的关于低碳生活的短文"}],
-                       "max_tokens": 300, "stream": True}).encode()
+                       "max_tokens": 300, "stream": True,
+                       "stream_options": {"include_usage": True}}).encode()
     req = urllib.request.Request(BASE + "/v1/chat/completions", data=body,
                                  headers={"Content-Type": "application/json"})
-    t0 = time.time(); ttft = None; tokens = 0
+    t0 = time.time(); ttft = None; chunks = 0; tokens = None
     with urllib.request.urlopen(req, timeout=600) as resp:
-        prev = ""
         for raw in resp:
             line = raw.decode().strip()
             if not line.startswith("data:") or line == "data: [DONE]":
                 continue
             c = json.loads(line[5:])
-            if c["choices"][0].get("delta", {}).get("content"):
+            if c.get("usage") and c["usage"].get("completion_tokens") is not None:
+                tokens = c["usage"]["completion_tokens"]
+            if c["choices"] and c["choices"][0].get("delta", {}).get("content"):
                 if ttft is None:
                     ttft = time.time() - t0
-                tokens += 1
+                chunks += 1
     dt = time.time() - t0
-    print(f"  流式: TTFT={ttft:.2f}s  生成{tokens}chunks/{dt:.1f}s = {tokens/dt:.1f} chunks/s")
+    n = tokens if tokens is not None else chunks
+    unit = "tokens" if tokens is not None else "chunks"
+    extra = "" if tokens is None or tokens == chunks else f"  (content chunks={chunks})"
+    print(f"  流式: TTFT={ttft:.2f}s  生成{n} {unit}/{dt:.1f}s = {n/dt:.1f} {unit}/s{extra}")
 
 print(f"== 目标 {BASE}  序列请求 x{N_SEQ} ==")
 run_concurrent(N_SEQ)

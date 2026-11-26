@@ -225,6 +225,7 @@ async def chat_completions(request: Request):
         threshold = STATE["threshold"]
     verbose = bool(body.get("guard_verbose", STATE["verbose"]))
     interrupt = bool(body.get("guard_interrupt", STATE["interrupt"]))
+    include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
 
     prompt_ids = _encode_messages(messages, add_generation_prompt=True,
                                   extra_kwargs=body.get("chat_template_kwargs"))
@@ -264,10 +265,12 @@ async def chat_completions(request: Request):
         prev = ""
         first = True
         aborted = None
+        last_out = None
         store = get_store()
         try:
             async for out in STATE["engine"].generate(
                     {"prompt_token_ids": prompt_ids}, sampling, req_id):
+                last_out = out
                 # streaming guard: stop as soon as a category crosses the line
                 if interrupt and aborted is None:
                     hit = _latest_slim(store, store.heads, threshold, req_id)
@@ -304,6 +307,14 @@ async def chat_completions(request: Request):
                        "choices": [{"index": 0, "delta": {},
                                     "finish_reason": finish}],
                        **({"guard_result": guard} if guard else {})})
+            if include_usage and last_out is not None:
+                ct = len(last_out.outputs[0].token_ids)
+                yield sse({"id": req_id, "object": "chat.completion.chunk",
+                           "created": created, "model": model_name,
+                           "choices": [],
+                           "usage": {"prompt_tokens": len(prompt_ids),
+                                     "completion_tokens": ct,
+                                     "total_tokens": len(prompt_ids) + ct}})
             yield "data: [DONE]\n\n"
         except Exception:  # ensure the guard record never leaks
             store.pop_all(req_id)
