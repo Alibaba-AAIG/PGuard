@@ -9,10 +9,10 @@ weight changes** -- the integration is a pip-installable package that hooks in
 through vLLM's `vllm.general_plugins` entry point.
 
 Verified with Qwen3.5-9B (FP8-dynamic) on a single RTX 4090 24G: three heads
-online, 8-way concurrency at **328~350 tok/s** (pure-backbone eager baseline:
-169~210 tok/s), standalone moderation round-trip ~64 ms. With scoring thinned
+online, 8-way concurrency at **328–350 tok/s** (pure-backbone eager baseline:
+169–210 tok/s), standalone moderation round-trip ~64 ms. With scoring thinned
 to every 10th output token (`PGUARD_COPY_LOGITS_PROB=0.1`) the same setup
-reaches **463~468 tok/s**.
+reaches **463–468 tok/s**.
 
 ## Install
 
