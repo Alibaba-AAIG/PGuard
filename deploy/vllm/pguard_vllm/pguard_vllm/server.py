@@ -31,6 +31,7 @@ from vllm.sampling_params import SamplingParams  # noqa: E402
 from vllm.v1.engine.async_llm import AsyncLLM  # noqa: E402
 
 from .plugin import register as _register_plugin  # noqa: E402
+from .pguard_config import get_config  # noqa: E402
 from .store import GuardStore, get_store  # noqa: E402
 
 logging.basicConfig(level=logging.INFO)
@@ -40,9 +41,9 @@ _register_plugin()  # idempotent; also done via entry point
 
 app = FastAPI(title="pguard-vllm")
 STATE = {"engine": None, "tokenizer": None, "model_name": "pguard-backbone",
-         "head_path": None, "threshold": 0.5,
-         "verbose": bool(int(os.getenv("PGUARD_VERBOSE", "0"))),
-         "interrupt": bool(int(os.getenv("PGUARD_INTERRUPT", "0")))}
+         "head_path": None, "threshold": get_config().threshold,
+         "verbose": get_config().verbose,
+         "interrupt": get_config().interrupt}
 
 
 # --------------------------------------------------------------------------
@@ -485,8 +486,8 @@ def main():
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--served-model-name", default="pguard-backbone")
     parser.add_argument("--guard-threshold", type=float,
-                        default=float(os.environ.get("PGUARD_THRESHOLD", "0.5")))
-    parser.add_argument("--head-path", default=os.environ.get("PGUARD_HEAD_PATH"))
+                        default=get_config().threshold)
+    parser.add_argument("--head-path", default=get_config().head_path)
     args, remaining = parser.parse_known_args()
     if args.self_test:
         raise SystemExit(_self_test())
@@ -513,7 +514,15 @@ def main():
     # skips Python hooks); PGUARD_CAPTURE_MODE=aux uses vLLM's EAGLE3-style
     # capture and can run with graphs (PGUARD_ENFORCE_EAGER=0). Default stays
     # eager (proven configuration).
-    engine_args.enforce_eager = os.environ.get("PGUARD_ENFORCE_EAGER", "1") == "1"
+    engine_args.enforce_eager = get_config().enforce_eager
+    if get_config().capture_mode == "hooks" and not engine_args.enforce_eager:
+        # fail fast: under graph replay the Python hooks never run and the
+        # guard would silently rescore the last eager features
+        raise SystemExit(
+            "pguard_vllm: PGUARD_CAPTURE_MODE=hooks cannot score under CUDA "
+            "graph (replay never runs Python hooks -> stale features). Set "
+            "PGUARD_ENFORCE_EAGER=1, or use PGUARD_CAPTURE_MODE=aux for "
+            "graph mode.")
     overrides = dict(engine_args.hf_overrides or {})
     overrides.update({"architectures": ["Qwen3_5PGuardForConditionalGeneration"]})
     engine_args.hf_overrides = overrides
@@ -538,8 +547,8 @@ def main():
     STATE["head_path"] = args.head_path
     STATE["threshold"] = args.guard_threshold
     STATE["model_name"] = args.served_model_name
-    STATE["verbose"] = bool(int(os.getenv("PGUARD_VERBOSE", "0"))) or bool(int(os.getenv("PGUARD_DEBUG", "0")))
-    STATE["interrupt"] = bool(int(os.getenv("PGUARD_INTERRUPT", "0")))
+    STATE["verbose"] = get_config().verbose or get_config().debug
+    STATE["interrupt"] = get_config().interrupt
     STATE["engine_args"] = engine_args
 
     from transformers import AutoTokenizer

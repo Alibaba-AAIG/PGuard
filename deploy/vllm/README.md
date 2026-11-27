@@ -101,9 +101,10 @@ See `DESIGN.md` for the vLLM-internals facts this relies on.
 # module self-tests
 python3 -m pguard_vllm.store
 python3 -m pguard_vllm.state_pool
+python3 -m pguard_vllm.pguard_config        # env config parsing
 python3 -m pguard_vllm.model        # scoring-cadence dispatch
 python3 -m pguard_vllm.server --self-test   # streaming interrupt check
-python3 -m pguard_vllm.head         # needs PGUARD_PW_DIR pointing at checkpoints
+python3 -m pguard_vllm.heads        # needs PGUARD_PW_DIR pointing at checkpoints
 
 # end-to-end verdict cases
 bash pguard_smoke_test.sh 13553

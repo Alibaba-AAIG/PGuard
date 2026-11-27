@@ -16,9 +16,11 @@ import logging
 import os
 import shutil
 
+from .pguard_config import get_config
+
 logger = logging.getLogger("pguard_vllm")
 
-STORE_DIR = os.environ.get("PGUARD_STORE_DIR", "/dev/shm/pguard_store")
+STORE_DIR = get_config().store_dir
 
 
 def load_task_schema(head_path: str):
@@ -40,19 +42,19 @@ def head_name_from_dir(subdir_or_path: str) -> str:
 def resolve_head_dirs() -> dict:
     """{head_name: checkpoint_dir} from PGUARD_HEADS / PGUARD_HEAD_SUBDIR /
     PGUARD_HEAD_PATH (first match wins per name)."""
+    cfg = get_config()
     dirs = {}
-    single = os.environ.get("PGUARD_HEAD_PATH")
-    if single:
-        dirs[head_name_from_dir(single)] = single
-    sub = os.environ.get("PGUARD_HEAD_SUBDIR")
-    if sub:
-        dirs[head_name_from_dir(sub)] = os.path.join("/pguard_heads", sub)
-    multi = os.environ.get("PGUARD_HEADS")
-    if multi:
-        for sub in multi.split(","):
+    if cfg.head_path:
+        dirs[head_name_from_dir(cfg.head_path)] = cfg.head_path
+    if cfg.head_subdir:
+        dirs[head_name_from_dir(cfg.head_subdir)] = os.path.join(
+            "/pguard_heads", cfg.head_subdir)
+    if cfg.heads:
+        for sub in cfg.heads.split(","):
             sub = sub.strip()
             if sub:
-                dirs[head_name_from_dir(sub)] = os.path.join("/pguard_heads", sub)
+                dirs[head_name_from_dir(sub)] = os.path.join(
+                    "/pguard_heads", sub)
     return dirs
 
 

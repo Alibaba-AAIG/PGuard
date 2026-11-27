@@ -33,6 +33,8 @@
 import logging
 import os
 
+from .pguard_config import get_config
+
 logger = logging.getLogger("pguard_vllm")
 
 _current_sched = None         # req_id -> scheduled token count (this step)
@@ -41,10 +43,9 @@ _last_aux = None              # aux hidden states from the last forward
 _prompt_lens = {}             # req_id -> prompt token length
 _patched = False
 _DBG = {"n": 0}
-_AUX_MODE = os.environ.get("PGUARD_CAPTURE_MODE", "hooks").strip().lower() == "aux"
 
 # Runner class candidates, most-compatible first. Extra candidates for other
-# vLLM versions can be appended via PGUARD_RUNNER_CANDIDATES
+# vLLM versions come via PGUARD_RUNNER_CANDIDATES
 # ("vllm.v1.worker.gpu_model_runner.GPUModelRunner,vllm.v1.worker.gpu.model_runner.GPUModelRunnerV2,...").
 _BASE_RUNNER_CANDIDATES = (
     "vllm.v1.worker.gpu_model_runner:GPUModelRunner",
@@ -54,10 +55,8 @@ _BASE_RUNNER_CANDIDATES = (
 
 def _runner_candidates():
     candidates = list(_BASE_RUNNER_CANDIDATES)
-    extra = os.environ.get("PGUARD_RUNNER_CANDIDATES", "")
-    for item in extra.split(","):
-        item = item.strip()
-        if item and ":" in item and item not in candidates:
+    for item in get_config().runner_candidates:
+        if item not in candidates:
             candidates.append(item)
     return candidates
 
@@ -81,14 +80,15 @@ def _resolve_aux(runner):
             return aux
     return None
 
-_TRACE = os.environ.get("PGUARD_TRACE", "/dev/shm/pguard_store/_patch_trace.log")
+_TRACE = None  # resolved lazily from the config (PGUARD_TRACE)
 
 
 def _trace(msg):
     """Ground-truth probe: direct file write, independent of logging setup."""
     try:
-        os.makedirs(os.path.dirname(_TRACE), exist_ok=True)
-        fd = os.open(_TRACE, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
+        path = get_config().trace_path
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
         try:
             os.write(fd, ("%d %s\n" % (os.getpid(), msg)).encode())
         finally:
@@ -227,12 +227,13 @@ def _install_patch():
         except Exception as e:
             _trace("runner import failed: %s: %r" % (mod, e))
 
+    aux_mode = get_config().capture_mode == "aux"
     patched_any = False
     for cls in targets:
         try:
             if getattr(cls.execute_model, "_pguard_patched", False):
                 continue
-            if _AUX_MODE and not getattr(cls, "_pguard_aux_init", False):
+            if aux_mode and not getattr(cls, "_pguard_aux_init", False):
                 # The aux tuple output must be enabled for graph capture and
                 # replay, but V2's load_model asserts aux requires a drafter
                 # (speculative_config is None here). Keep the flag False
@@ -268,7 +269,7 @@ def _install_patch():
     if patched_any:
         _patched = True
         logger.info("pguard_vllm: GPUModelRunner patched for guard capture "
-                    "(aux_mode=%s)", _AUX_MODE)
+                    "(aux_mode=%s)", get_config().capture_mode == "aux")
     else:
         # a guard service that silently runs without scoring is a security
         # failure -- refuse to start instead

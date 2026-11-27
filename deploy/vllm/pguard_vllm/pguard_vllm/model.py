@@ -8,25 +8,28 @@
 # integration fully concurrent (no request serialization, no global locks
 # around generation).
 #
-# Multiple heads can run simultaneously: they share the same captured hidden
-# states (same capture layers) and are scored in parallel per step. Available
-# variants: lasttok (stateless), ema (per-request multi-scale EMA state),
-# gru (query summary h0 + CfC response recurrence).
+# The safety heads live in the heads/ package (GuardHeadRegistry, vLLM
+# ModelRegistry style): this class only captures features, segments the batch
+# per request, dispatches rows to each head's score_step and persists the
+# returned vectors into the GuardStore. Multiple heads share the same
+# captured hidden states (union of their capture layers) and are scored in
+# parallel per step.
 #
 # Scoring is invoked from the patched GPUModelRunner.execute_model (see
 # patch_runner.py) AFTER the engine step, for real scheduler steps only --
 # this keeps the guard out of CUDA-graph capture and off the dummy-run path.
 #
 # Capture modes (PGUARD_CAPTURE_MODE):
-#   hooks (default): forward hooks on the capture layers; eager mode only.
-#   aux: vLLM-native EAGLE3-style capture -- the model returns
-#        (hidden_states, aux_hidden_states) and the runner's
-#        use_aux_hidden_state_outputs machinery maintains fresh buffers across
-#        CUDA-graph replays. Required for PGUARD_ENFORCE_EAGER=0.
+#   hooks: forward hooks on the capture layers; eager mode only.
+#   aux:   vLLM-native EAGLE3-style capture -- the model returns
+#          (hidden_states, aux_hidden_states) and the runner's
+#          use_aux_hidden_state_outputs machinery maintains fresh buffers
+#          across CUDA-graph replays. Required for PGUARD_ENFORCE_EAGER=0.
 #
-# Per-request recurrent state lives in slot-pooled GPU buffers (see
-# state_pool.py): fixed memory, one index_select/index_put_ per step, slots
-# freed (and zeroed) as soon as the scheduler reports the request finished.
+# Per-request recurrent state lives inside each head's slot-pooled GPU
+# buffers (see heads/base.py + state_pool.py): fixed memory, one
+# index_select/index_put_ per step, slots freed (and zeroed) as soon as the
+# scheduler reports the request finished.
 #
 # EngineCore runs in its own process; per-request score series are handed to
 # the API process through the file-backed GuardStore (see store.py).
@@ -56,8 +59,8 @@ import torch
 
 from vllm.model_executor.models.qwen3_5 import Qwen3_5ForConditionalGeneration
 
-from .head import build_head_from_checkpoint
-from .state_pool import StatePool
+from .heads import build_head_from_checkpoint, resolve_head_dtype
+from .pguard_config import get_config
 from .store import get_store, resolve_head_dirs
 
 logger = logging.getLogger("pguard_vllm")
@@ -65,11 +68,21 @@ logger = logging.getLogger("pguard_vllm")
 _MAX_TRACKED_STATES = 4096
 _EVICT_BACKOFF = 32  # exists() backstop sweep cadence (steps)
 
-_HEAD_DTYPES = {
-    "float32": torch.float32, "fp32": torch.float32, "": torch.float32,
-    "bfloat16": torch.bfloat16, "bf16": torch.bfloat16,
-    "float16": torch.float16, "fp16": torch.float16,
-}
+# counted degradation paths (see _bail): reason -> consecutive/total count
+_BAILS: dict[str, int] = {}
+
+
+def _bail(reason: str) -> None:
+    """Record a guard step that produced NO scores.
+
+    Degradation must leave traces (a silently disabled guard is a security
+    failure): logged loudly on the first occurrence and every 1000th repeat;
+    PGUARD_TRACE_GUARD=1 still gives per-step detail via _dbg."""
+    n = _BAILS.get(reason, 0) + 1
+    _BAILS[reason] = n
+    if n == 1 or n % 1000 == 0:
+        logger.error("pguard_vllm: guard step produced no scores (%s) x%d",
+                     reason, n)
 
 # raw PGuard model instance, resolved by patch_runner after engine load
 _MODEL = None
@@ -84,44 +97,24 @@ def _parse_layers(spec, num_hidden_layers: int) -> list[int]:
     return [int(x) for x in spec]
 
 
-def _ema_fold(alphas, feats, state):
-    """Exact multi-scale causal EMA fold, closed form:
-
-        ema_n = sum_t a*(1-a)^(n-1-t)*x_t + (1-a)^n * ema_0
-
-    alphas: (n_scales, H) fp32; feats: (C, n, H) fp32; state: (C, n_scales, H)
-    fp32. Replaces the per-token Python loop (n kernel-launch rounds) with one
-    weighted-sum einsum; same math as the official torch fallback
-    (pguard/guard/history_state.py prefill_update).
-    """
-    C, n, H = feats.shape
-    if n == 0:
-        return state
-    ret = 1.0 - alphas  # (n_scales, H)
-    if n == 1:
-        return (alphas.unsqueeze(0) * feats[:, 0, :].unsqueeze(1)
-                + ret.unsqueeze(0) * state)
-    # weight of token j (0-based): a * (1-a)^(n-1-j)
-    k = torch.arange(n - 1, -1, -1, device=feats.device, dtype=torch.float32)
-    w = alphas.unsqueeze(-1) * torch.exp(torch.log(ret).unsqueeze(-1) * k)
-    within = torch.einsum("shn,cnh->csh", w, feats)  # (C, n_scales, H)
-    decay = torch.exp(torch.log(ret) * float(n))     # (n_scales, H)
-    return within + decay.unsqueeze(0) * state
-
-
 class Qwen3_5PGuardForConditionalGeneration(Qwen3_5ForConditionalGeneration):
 
     def __init__(self, *, vllm_config, prefix="model"):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self.vllm_config = vllm_config
         self._pguard_ready = False
         self._capture_module_idx: list[int] = []
         self._cap: dict[int, torch.Tensor] = {}
+        # hooks-mode stale-capture detector: under CUDA-graph replay the
+        # Python forward never runs, so the captured tensors keep the SAME
+        # object identity across steps (eager always produces fresh ones)
+        self._cap_sig: tuple | None = None
+        self._stale_steps = 0
         self.pguard_heads: dict[str, torch.nn.Module] = {}
         self.pguard_cfgs: dict[str, object] = {}
-        # slot-pooled per-request recurrent state, one pool per head:
-        #   ema: (C, n_scales, hidden) running EMA vectors per slot
-        #   gru: (mem_dim,) response recurrence hidden state per slot
-        self._pools: dict[str, StatePool] = {}
+        # per-head read positions in the union capture stack (engine-side
+        # bookkeeping; heads slice their own features at score time)
+        self._layer_pos_by_head: dict[str, list[int]] = {}
         # requests whose prefill has been scored (decode-stage detection
         # without file IO)
         self._prefill_done: set[str] = set()
@@ -132,10 +125,6 @@ class Qwen3_5PGuardForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         self._decode_step = 0
         self._step_count = 0
         self._capture_mode = "hooks"
-        # prefill scoring breadth for token-wise heads (lasttok):
-        # all = every prefill token (enables prompt_series); last = each
-        # request's final token only (official PGUARD_PREFILL_RISK_MODE=last)
-        self._prefill_risk_mode = "all"
         # live status for the streaming interrupt check (server side):
         # {req_id: {head: {"plast": [...], "dmax": [...]}}}, rewritten to the
         # store's small live file once per step for the requests it changed
@@ -157,41 +146,49 @@ class Qwen3_5PGuardForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         global _MODEL
         if self._pguard_ready:
             return
+        cfg = get_config()
         head_dirs = resolve_head_dirs()
         if not head_dirs:
             raise RuntimeError("no guard heads configured "
                                "(set PGUARD_HEADS or PGUARD_HEAD_PATH)")
 
         device = next(self.language_model.model.parameters()).device
-        head_dtype = _HEAD_DTYPES.get(
-            os.environ.get("PGUARD_HEAD_DTYPE", "").strip().lower(),
-            torch.float32)
+        head_dtype = resolve_head_dtype(cfg.head_dtype)
         hf_indices = None
         num_layers = None
         per_head_indices = {}
+        self.pguard_heads = {}
+        self.pguard_cfgs = {}
         for name, path in head_dirs.items():
-            cfg, head = build_head_from_checkpoint(path)
-            head = head.to(device=device, dtype=head_dtype)
+            head_cfg, head = build_head_from_checkpoint(path)
             self.pguard_heads[name] = head
-            self.pguard_cfgs[name] = cfg
-            num_layers = getattr(cfg, "num_hidden_layers", None) or 32
+            self.pguard_cfgs[name] = head_cfg
+            num_layers = getattr(head_cfg, "num_hidden_layers", None) or 32
             # official resolution order (pguard/config.py +
             # guard/guard_utils.py): env override, then the checkpoint's
             # pguard_capture_layers. feature_layers is a TRAINING-side arg
             # and must only be a last-resort fallback.
-            spec = (os.environ.get("PGUARD_CAPTURE_LAYERS", "").strip()
-                    or getattr(cfg, "pguard_capture_layers", None)
-                    or getattr(cfg, "selected_layers", None)
-                    or getattr(cfg, "feature_layers", None)
+            spec = (cfg.capture_layers
+                    or getattr(head_cfg, "pguard_capture_layers", None)
+                    or getattr(head_cfg, "selected_layers", None)
+                    or getattr(head_cfg, "feature_layers", None)
                     or "all")
             indices = _parse_layers(spec, num_layers)
             per_head_indices[name] = indices
             hf_indices = sorted(set(hf_indices or []) | set(indices))
 
-        self._capture_mode = (os.environ.get("PGUARD_CAPTURE_MODE", "hooks")
-                              .strip().lower())
-        if self._capture_mode not in ("hooks", "aux"):
-            self._capture_mode = "hooks"
+        self._capture_mode = cfg.capture_mode
+
+        # Engine-side backstop for the pure `vllm serve` path (no server.py
+        # preflight runs there): hooks capture needs eager -- graph replay
+        # never executes the Python hooks and would rescore stale features.
+        if self._capture_mode == "hooks" and not getattr(
+                getattr(vllm_config, "model_config", None),
+                "enforce_eager", True):
+            raise RuntimeError(
+                "pguard_vllm: capture_mode=hooks requires enforce_eager "
+                "(CUDA-graph replay never runs Python hooks); set "
+                "PGUARD_ENFORCE_EAGER=1 or PGUARD_CAPTURE_MODE=aux")
 
         if self._capture_mode == "aux":
             # vLLM-native capture (EAGLE3 machinery): the inner model appends
@@ -212,60 +209,28 @@ class Qwen3_5PGuardForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             for name, indices in per_head_indices.items()
         }
 
-        # slot-pooled recurrent state + score accumulators, one pool per head
+        # heads own their recurrent state + GPU-side aggregation; the engine
+        # hands each head its flat-score layout and dispatches rows per step
         global guard_store
         guard_store = get_store(head_dirs)
-        max_slots = int(os.environ.get("PGUARD_MAX_SLOTS", "64"))
-        self._pools = {}
         for name, head in self.pguard_heads.items():
-            kind = self.pguard_cfgs[name].pguard_version
-            if kind == "ema":
-                n_scales = head.ema_fusion.ema_module.alphas.shape[0]
-                ema_shape = (len(self._layer_pos_by_head[name]), n_scales,
-                             next(head.parameters()).shape[-1])
-                self._pools[name] = StatePool(name, device,
-                                              ema_shape=ema_shape,
-                                              max_slots=max_slots,
-                                              total_cls=guard_store.total_cls(name))
-            elif kind == "gru":
-                self._pools[name] = StatePool(name, device,
-                                              mem_dim=head.mem_dim,
-                                              max_slots=max_slots,
-                                              total_cls=guard_store.total_cls(name))
-            else:
-                # stateless head: no recurrent state, accumulator only
-                self._pools[name] = StatePool(name, device,
-                                              max_slots=max_slots,
-                                              total_cls=guard_store.total_cls(name))
+            head.bind(device=device, dtype=head_dtype,
+                      layer_pos=self._layer_pos_by_head[name],
+                      total_cls=guard_store.total_cls(name),
+                      task_layout=guard_store.task_layout(name)[0],
+                      max_slots=cfg.max_slots)
 
-        self._prefill_risk_mode = (os.environ.get("PGUARD_PREFILL_RISK_MODE",
-                                                  "all").strip().lower())
-        if self._prefill_risk_mode not in ("all", "last"):
-            self._prefill_risk_mode = "all"
-
-        prob = os.environ.get("PGUARD_COPY_LOGITS_PROB", "1.0").strip()
-        interval_env = os.environ.get("PGUARD_SCORE_INTERVAL", "").strip()
-        if interval_env:
-            self._score_interval = max(0, int(interval_env))
-        else:
-            try:
-                prob = float(prob)
-            except ValueError:
-                prob = 1.0
-            self._score_interval = (0 if prob <= 0.0 else
-                                    1 if prob >= 1.0 else
-                                    max(1, round(1.0 / prob)))
+        self._score_interval = cfg.score_interval
         self._decode_step = 0
         self._step_count = 0
 
         self._pguard_ready = True
         _MODEL = self
         logger.info("pguard_vllm: guard ready (heads=%s, capture hf-layers=%s, "
-                    "mode=%s, dtype=%s, score_interval=%s, prefill_mode=%s, "
-                    "slots=%d, device=%s)",
+                    "mode=%s, dtype=%s, score_interval=%s, slots=%d, "
+                    "device=%s)",
                     sorted(self.pguard_heads), hf_indices, self._capture_mode,
-                    head_dtype, self._score_interval, self._prefill_risk_mode,
-                    max_slots, device)
+                    head_dtype, self._score_interval, cfg.max_slots, device)
 
     def _make_hook(self, module_idx: int):
         def hook(module, args, kwargs, output):
@@ -293,7 +258,7 @@ class Qwen3_5PGuardForConditionalGeneration(Qwen3_5ForConditionalGeneration):
     # -- scoring dispatch (called from patch_runner after the engine step) --
     def run_guard_step(self, sched: dict, flags: list | None, aux) -> None:
         def _dbg(msg):
-            if os.environ.get("PGUARD_TRACE_GUARD", "") == "1":
+            if get_config().trace_guard:
                 try:
                     fd = os.open("/dev/shm/pguard_store/_guard_trace.log",
                                  os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o644)
@@ -316,17 +281,27 @@ class Qwen3_5PGuardForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         if self._capture_mode == "aux":
             caps = list(aux) if aux else None
             if not caps:
-                _dbg("bail: no aux")
+                _bail("aux_hidden_states_missing")
                 return
         else:
             caps = [self._cap.get(mi) for mi in self._capture_module_idx]
             if not caps or any(c is None for c in caps):
-                _dbg("bail: caps missing %s/%s" %
-                     (len(self._cap), len(self._capture_module_idx)))
+                _bail("captured_layers_missing")
                 return
+            # stale-capture detection: identical tensor objects two steps in
+            # a row mean the Python forward did not run (CUDA-graph replay)
+            sig = tuple(id(c) for c in caps)
+            if sig == self._cap_sig:
+                self._stale_steps += 1
+                if self._stale_steps >= 2:
+                    _bail("stale_capture_graph_replay")
+                    return
+            else:
+                self._cap_sig = sig
+                self._stale_steps = 0
         feats_all = torch.stack(caps, dim=0).to(torch.float32)  # (C, T, H)
         if feats_all.shape[1] < total:
-            _dbg("bail: rows %d < total %d" % (feats_all.shape[1], total))
+            _bail("captured_rows_short")
             return
         _dbg("scoring rows=%d total=%d" % (feats_all.shape[1], total))
         feats_all = feats_all[:, :total, :]
@@ -355,27 +330,15 @@ class Qwen3_5PGuardForConditionalGeneration(Qwen3_5ForConditionalGeneration):
                 self._decode_step += 1
                 score = self._decode_step % self._score_interval == 0
 
+        # one dispatch per head: heads return flat per-request vectors (one
+        # D2H each), the engine persists them store-side and folds live status
         for name, head in self.pguard_heads.items():
-            kind = self.pguard_cfgs[name].pguard_version
-            pos = self._layer_pos_by_head[name]
-            if kind == "lasttok":
-                # prefill rows always score; only decode rows follow the cadence
-                lt_decode = decode_rows if score else []
-                if prefill_rows or lt_decode:
-                    self._score_lasttok(name, head, pos,
-                                        prefill_rows + lt_decode,
-                                        [False] * len(prefill_rows)
-                                        + [True] * len(lt_decode))
-            elif kind == "ema":
-                if prefill_rows:
-                    self._ema_prefill(name, head, pos, prefill_rows)
-                if decode_rows:
-                    self._ema_decode(name, head, pos, decode_rows, score=score)
-            elif kind == "gru":
-                if prefill_rows:
-                    self._gru_prefill(name, head, pos, prefill_rows)
-                if decode_rows:
-                    self._gru_decode(name, head, pos, decode_rows, score=score)
+            result = head.score_step(prefill_rows, decode_rows, score=score)
+            if result is None:
+                continue
+            for rid, flat, n, is_dec in zip(result.req_ids, result.flats,
+                                            result.ns, result.is_decodes):
+                self._append_scores(name, rid, flat, n, is_dec)
         for rid in self._live_dirty:
             guard_store.write_live(rid, {h: {"plast": v["plast"], "dmax": v["dmax"]}
                                          for h, v in self._live[rid].items()})
@@ -393,24 +356,19 @@ class Qwen3_5PGuardForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             self._live.pop(rid, None)
             self._live_dirty.discard(rid)
             guard_store.close_live(rid)
-        for head, pool in self._pools.items():
+        for name, head in self.pguard_heads.items():
             for rid in req_ids:
-                if not pool.contains(rid):
-                    continue
-                hp, hd, plast, dlast, dmax = pool.acc_read(pool.slot_of[rid])
-                if hp or hd:
-                    guard_store.append_final(head, rid, plast, dlast, dmax,
-                                             hp, hd)
-                guard_store.close_fd(head, rid)
-        for pool in self._pools.values():
-            for rid in req_ids:
-                pool.free_req(rid)
+                fin = head.finalize(rid)
+                if fin is not None and (fin[0] or fin[1]):
+                    guard_store.append_final(name, rid, fin[2], fin[3],
+                                             fin[4], fin[0], fin[1])
+                guard_store.close_fd(name, rid)
 
     # -- shared helpers ----------------------------------------------------
     def _append_scores(self, head: str, req_id: str, flat, n: int,
                        is_decode: bool):
         # flat: task-major class-probability vector(s) for this step's n
-        # tokens (CPU list, length n * total_cls; see state_pool/store)
+        # tokens (CPU list, length n * total_cls; see heads/base + store)
         guard_store.append(head, req_id, flat, n, is_decode)
         self._live_fold(head, req_id, flat, n, is_decode)
 
@@ -464,65 +422,20 @@ class Qwen3_5PGuardForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             vec["written"] = top
             self._live_dirty.add(req_id)
 
-    def _acc_update(self, head_name: str, req_ids: list[str], flats, ns,
-                    is_decodes) -> None:
-        """GPU-side running aggregation (R2): fold each request's newest
-        scored-token vector into its slot accumulator (one small kernel chain
-        per scoring step). Read back once on finish for the final record."""
-        pool = self._pools.get(head_name)
-        if pool is None or pool.acc_last_p is None or not flats:
-            return
-        layout, _ = guard_store.task_layout(head_name)
-        device = flats[0].device
-        slot_t = pool.slots_for(req_ids, device)
-        last_vecs = []
-        for f, n in zip(flats, ns):
-            parts = []
-            for task, start, stop in layout:
-                n_cls = stop - start
-                # task i's block sits at [n*start, n*stop); its last token is
-                # the block's tail
-                parts.append(f[n * start + (n - 1) * n_cls:n * stop])
-            last_vecs.append(torch.cat(parts))
-        pool.acc_update(slot_t, torch.stack(last_vecs), is_decodes)
-
-    def _probs_to_cpu(self, head_name: str, probs_per_req, req_ids: list[str],
-                      is_decodes):
-        """Move a per-request stack of probability tensors to the host with
-        ONE device-to-host transfer, as flat task-major vectors
-        ([task0 tok0..tokN | task1 ...], length n * total_cls per request;
-        layout mirrors the official interrupt_policy column ranges). Also
-        folds the newest scored-token vectors into the GPU accumulators."""
-        total = guard_store.total_cls(head_name)
-        flats, ns = [], []
-        for probs in probs_per_req:
-            flats.append(torch.cat([p.reshape(-1) for p in probs]))
-            ns.append(int(probs[0].shape[0]) if probs else 0)
-        if not flats:
-            return []
-        self._acc_update(head_name, req_ids, flats, ns, is_decodes)
-        flat = torch.cat(flats).tolist()  # single D2H transfer
-        out, ofs = [], 0
-        for n in ns:
-            out.append(flat[ofs:ofs + n * total])
-            ofs += n * total
-        return out
-
     def _evict_finished_states(self):
         """Backstop cleanup: the scheduler's finished_req_ids handle the
         common case (note_finished); this file-existence sweep catches any
         other path at a low cadence. Bounded pools as safety valve."""
         if self._step_count % _EVICT_BACKOFF == 0:
-            for pool in self._pools.values():
-                for req_id in pool.req_ids():
-                    if not any(guard_store.exists(head, req_id)
-                               for head in self.pguard_heads):
-                        pool.free_req(req_id)
-                        for head in self.pguard_heads:
-                            guard_store.close_fd(head, req_id)
-        for pool in self._pools.values():
-            while len(pool.slot_of) > _MAX_TRACKED_STATES:
-                pool.free_req(pool.req_ids()[0])
+            for name, head in self.pguard_heads.items():
+                for req_id in head.tracked_req_ids():
+                    if not any(guard_store.exists(h, req_id)
+                               for h in self.pguard_heads):
+                        head.free_req(req_id)
+                        for h in self.pguard_heads:
+                            guard_store.close_fd(h, req_id)
+        for head in self.pguard_heads.values():
+            head.evict_oldest_beyond(_MAX_TRACKED_STATES)
 
     def _decode_flags(self, req_ids: list[str], counts: list[int]) -> list[bool]:
         """Stage per batch row: True = decode step.
@@ -534,198 +447,10 @@ class Qwen3_5PGuardForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         flags = []
         for rid, n in zip(req_ids, counts):
             past = rid in self._prefill_done \
-                or any(pool.contains(rid) for pool in self._pools.values())
+                or any(head.contains(rid)
+                       for head in self.pguard_heads.values())
             flags.append(bool(past) and n == 1)
         return flags
-
-    def _pad_rows(self, rows):
-        """Pad ragged (C, n_i, H) row features into (B, C, max_n, H) + mask."""
-        C = rows[0][1].shape[0]
-        H = rows[0][1].shape[2]
-        max_n = max(f.shape[1] for _, f in rows)
-        device = rows[0][1].device
-        padded = torch.zeros(len(rows), C, max_n, H, device=device,
-                             dtype=torch.float32)
-        mask = torch.zeros(len(rows), max_n, dtype=torch.bool, device=device)
-        for i, (_, f) in enumerate(rows):
-            padded[i, :, :f.shape[1], :] = f
-            mask[i, :f.shape[1]] = True
-        return padded, mask
-
-    # -- lasttok (stateless) ----------------------------------------------
-    def _score_lasttok(self, head_name: str, head, layer_pos, rows, decode_flags):
-        rows = [(rid, f[layer_pos]) for rid, f in rows]
-        if self._prefill_risk_mode == "last":
-            # score only each request's final token (decode rows are n=1, so
-            # this is a no-op for them)
-            rows = [(rid, f[:, -1:, :]) for rid, f in rows]
-        if all(f.shape[1] == 1 for _, f in rows):
-            # every row already has exactly one token
-            padded = torch.stack([f for _, f in rows], dim=0)  # (B, C, 1, H)
-        else:
-            padded, _mask = self._pad_rows(rows)
-        hidden = padded.to(dtype=self._head_dtype(head_name))
-        with torch.no_grad():
-            out = head(features=hidden, token_type_ids=None,
-                       label_type=None, label_marker=None)
-        probs = [torch.softmax(l.float(), dim=-1)
-                 for l in out.full_classification_logits]  # (B, n, n_cls)
-        ns = [f.shape[1] for _, f in rows]
-        req_ids = [rid for rid, _ in rows]
-        cpu = self._probs_to_cpu(head_name, [[p[i, :n] for p in probs]
-                                             for i, n in enumerate(ns)],
-                                 req_ids, decode_flags)
-        for i, (req_id, _) in enumerate(rows):
-            self._append_scores(head_name, req_id, cpu[i], ns[i],
-                                decode_flags[i])
-
-    # -- ema (seq) ---------------------------------------------------------
-    def _ema_alphas(self, head):
-        """(n_scales, H) fp32 alphas on the head's device, cached per head."""
-        cached = getattr(head, "_pguard_alphas", None)
-        device = next(head.parameters()).device
-        if cached is not None and cached.device == device:
-            return cached
-        alphas = head.ema_fusion.ema_module.alphas.to(device=device,
-                                                      dtype=torch.float32)
-        head._pguard_alphas = alphas
-        return alphas
-
-    def _head_dtype(self, head_name: str):
-        return next(self.pguard_heads[head_name].parameters()).dtype
-
-    def _ema_prefill(self, head_name: str, head, layer_pos, rows):
-        """Fold each prefill chunk into the request's EMA state (closed-form
-        causal recurrence, one weighted-sum kernel per chunk instead of a
-        per-token Python loop); score the chunk's LAST token only (the API
-        aggregates prompt-side risk from the last prefill record)."""
-        alphas = self._ema_alphas(head)  # (n_scales, H) fp32
-        pool = self._pools[head_name]
-        slot_t = pool.slots_for([rid for rid, _ in rows],
-                                rows[0][1].device)
-        states_b = pool.ema_read(slot_t)  # (B, C, n_scales, H) fp32, zeros for new
-        new_states, last_feats = [], []
-        for i, (req_id, feats_all) in enumerate(rows):
-            feats = feats_all[layer_pos]  # (C, n, H) fp32
-            state = _ema_fold(alphas, feats, states_b[i])
-            new_states.append(state)
-            last_feats.append(feats[:, -1, :])
-        states_b = torch.stack(new_states, dim=0)             # (B, C, n_scales, H)
-        pool.ema_write(slot_t, states_b)
-        feats_b = torch.stack(last_feats, dim=0).unsqueeze(2)  # (B, C, 1, H)
-        logits = self._ema_score_batch(head_name, head, states_b, feats_b)
-        probs_all = [torch.softmax(l.float()[:, 0], dim=-1) for l in logits]
-        cpu = self._probs_to_cpu(head_name, [[p[i].unsqueeze(0) for p in probs_all]
-                                             for i in range(len(rows))],
-                                 [rid for rid, _ in rows],
-                                 [False] * len(rows))
-        for i, (req_id, _) in enumerate(rows):
-            self._append_scores(head_name, req_id, cpu[i], 1, is_decode=False)
-
-    def _ema_score_batch(self, head_name: str, head, batch_states, feats_b):
-        """Gate -> merge -> fuse -> classify for a batch of tokens.
-
-        batch_states: (B, C, n_scales, H); feats_b: (B, C, 1, H). Returns
-        per-task logits of shape (B, 1, n_cls)."""
-        dtype = self._head_dtype(head_name)
-        feats = feats_b.to(dtype)
-        B, C, _, H = feats.shape
-        scores = head.gate(head.gate_norm(feats)).squeeze(-1)  # (B, C, 1)
-        if head.top_L >= C:
-            # all captured layers are kept: the top-k gather is a no-op, the
-            # weighted sum over the softmax weights is identical
-            w = torch.softmax(scores, dim=1).unsqueeze(-1)     # (B, C, 1, 1)
-            merged_cur = (feats * w).sum(dim=1)                # (B, 1, H)
-            st = batch_states.to(dtype)
-            merged_ema = (st * w).sum(dim=1)                   # (B, n_scales, H)
-        else:
-            topk_scores, topk_indices = torch.topk(scores, k=head.top_L, dim=1)
-            w = torch.softmax(topk_scores, dim=1)  # (B, topk, 1)
-            merged_cur = (feats.gather(1, topk_indices.unsqueeze(-1)
-                                       .expand(-1, -1, 1, H))
-                          * w.unsqueeze(-1)).sum(dim=1)  # (B, 1, H)
-            st = batch_states.to(dtype)
-            st_sel = st.gather(1, topk_indices.unsqueeze(-1)
-                               .expand(-1, -1, st.shape[2], st.shape[3]))
-            merged_ema = (st_sel * w.unsqueeze(2)).sum(dim=1)  # (B, n_scales, H)
-        ema_heads = [merged_ema[:, i].unsqueeze(1)
-                     for i in range(merged_ema.shape[1])]
-        fused = head.ema_fusion.fuse(ema_heads, merged_cur)  # (B, 1, H)
-        h = head.norm(fused)
-        h = head.input_proj(h)
-        for layer in head.adapter:
-            h = layer(h)
-        return [classifier(h) for classifier in head.classifiers]
-
-    def _ema_decode(self, head_name: str, head, layer_pos, rows, score=True):
-        """Batched single-token decode: the EMA state update runs on EVERY
-        step; scoring can be thinned via score=False (cadence)."""
-        alphas = self._ema_alphas(head)
-        pool = self._pools[head_name]
-        device = rows[0][1].device
-        slot_t = pool.slots_for([rid for rid, _ in rows], device)
-        batch_states = pool.ema_read(slot_t)  # (B, C, n_scales, H) fp32
-
-        feats_b = torch.stack([f[layer_pos] for _, f in rows], dim=0)  # (B, C, 1, H)
-        xi = feats_b.squeeze(2)  # (B, C, H)
-        batch_states = alphas.unsqueeze(0).unsqueeze(0) * xi.unsqueeze(2) \
-            + (1.0 - alphas.unsqueeze(0).unsqueeze(0)) * batch_states
-
-        pool.ema_write(slot_t, batch_states)
-        if not score:
-            return
-        B = len(rows)
-        logits = self._ema_score_batch(head_name, head, batch_states, feats_b)
-        probs_all = [torch.softmax(l.float()[:, 0], dim=-1) for l in logits]
-        cpu = self._probs_to_cpu(head_name, [[p[i].unsqueeze(0) for p in probs_all]
-                                             for i in range(B)],
-                                 [rid for rid, _ in rows], [True] * B)
-        for i, (req_id, _) in enumerate(rows):
-            self._append_scores(head_name, req_id, cpu[i], 1, is_decode=True)
-
-    # -- gru (cfc) ---------------------------------------------------------
-    def _gru_prefill(self, head_name: str, head, layer_pos, rows):
-        """Batched query summarization -> h0 state + query-level scores."""
-        rows = [(rid, f[layer_pos]) for rid, f in rows]
-        padded, mask = self._pad_rows(rows)
-        feats = padded.to(dtype=self._head_dtype(head_name))
-        with torch.no_grad():
-            query_logits_list, h0, _ = head.forward_prefill(feats, mask=mask)
-        probs_all = [torch.softmax(ql.float(), dim=-1)
-                     for ql in query_logits_list]  # (B, n_cls)
-        cpu = self._probs_to_cpu(head_name, [[p[i].unsqueeze(0) for p in probs_all]
-                                             for i in range(len(rows))],
-                                 [rid for rid, _ in rows],
-                                 [False] * len(rows))
-        pool = self._pools[head_name]
-        slot_t = pool.slots_for([rid for rid, _ in rows],
-                                rows[0][1].device)
-        pool.gru_write(slot_t, h0)
-        for i, (req_id, _) in enumerate(rows):
-            self._append_scores(head_name, req_id, cpu[i], 1, is_decode=False)
-
-    def _gru_decode(self, head_name: str, head, layer_pos, rows, score=True):
-        """Batched single-token CfC/GRU step with carried hidden state; the
-        state recurrence runs every step, scoring can be thinned."""
-        pool = self._pools[head_name]
-        device = rows[0][1].device
-        slot_t = pool.slots_for([rid for rid, _ in rows], device)
-        h_prev = pool.gru_read(slot_t)  # (B, mem_dim) fp32
-        feats = torch.stack([f[layer_pos] for _, f in rows],
-                            dim=0).to(self._head_dtype(head_name))
-        with torch.no_grad():
-            logits_list, h_new = head.forward_step(feats, h_prev,
-                                                   compute_scores=score)
-        pool.gru_write(slot_t, h_new)
-        if not score:
-            return
-        probs_all = [torch.softmax(l.float()[:, 0], dim=-1)
-                     for l in logits_list]  # (B, n_cls)
-        cpu = self._probs_to_cpu(head_name, [[p[i].unsqueeze(0) for p in probs_all]
-                                             for i in range(len(rows))],
-                                 [rid for rid, _ in rows], [True] * len(rows))
-        for i, (req_id, _) in enumerate(rows):
-            self._append_scores(head_name, req_id, cpu[i], 1, is_decode=True)
 
 
 # populated by Qwen3_5PGuardForConditionalGeneration._setup_pguard
@@ -735,31 +460,38 @@ guard_store = None
 
 
 if __name__ == "__main__":
-    # self-test: cadence dispatch. A prompt that joins while other requests
-    # are decoding keeps its Lasttok prompt-side score on every step; only
-    # decode rows thin out, and EMA/GRU state updates never thin out.
+    # self-test: cadence dispatch through the head registry interface. A
+    # prompt that joins while other requests are decoding keeps its Lasttok
+    # prompt-side score on every step; only decode rows thin out, and EMA/GRU
+    # state updates never thin out (the engine passes score=False; the heads
+    # keep updating state).
     import types
+
+    class _FakeHead:
+        """Records the dispatch contract: (name, prefill rids, decode rids,
+        score flag)."""
+
+        def __init__(self, name, calls):
+            self.name, self._calls = name, calls
+
+        def score_step(self, prefill_rows, decode_rows, score=True):
+            self._calls.append((self.name, [r for r, _ in prefill_rows],
+                                [r for r, _ in decode_rows], bool(score)))
+            return None
+
+        def contains(self, rid):
+            return False
 
     def _dispatch(interval, arrive):
         m = object.__new__(Qwen3_5PGuardForConditionalGeneration)
         m._pguard_ready, m._capture_mode, m._cap = True, "aux", {}
         m._capture_module_idx = [0, 1, 2]
         m._score_interval, m._decode_step, m._step_count = interval, 0, 0
-        m._prefill_done, m._prefill_risk_mode = set(), "all"
+        m._prefill_done = set()
         m._live, m._live_dirty = {}, set()
-        m.pguard_heads = {"lt": object(), "ema": object(), "gru": object()}
-        m.pguard_cfgs = {k: types.SimpleNamespace(pguard_version=v) for k, v in
-                         (("lt", "lasttok"), ("ema", "ema"), ("gru", "gru"))}
-        m._layer_pos_by_head = {"lt": 0, "ema": 1, "gru": 2}
         calls = []
-
-        def _rec(name):
-            return lambda *a, **k: calls.append(
-                (name, [r[0] for r in a[3]], k.get("score", True)))
-
-        for name in ("_score_lasttok", "_ema_prefill", "_ema_decode",
-                     "_gru_prefill", "_gru_decode"):
-            setattr(m, name, _rec(name))
+        m.pguard_heads = {n: _FakeHead(n, calls)
+                          for n in ("lt", "ema", "gru")}
         m._evict_finished_states = lambda *a, **k: None
         one = [torch.zeros(1, 8)] * 3
         for _ in range(arrive - 1):     # advance the decode-step counter
@@ -771,27 +503,22 @@ if __name__ == "__main__":
         m.run_guard_step(sched, flags, aux)
         return calls
 
-    def _lt_prompt_scored(calls):
-        return "B" in [rid for name, rids, _ in calls
-                       if name == "_score_lasttok" for rid in rids]
-
     bad = []
     for arrive in (1, 4, 10):           # production default: nothing thins out
         calls = _dispatch(1, arrive)
-        lt = [rids for name, rids, _ in calls if name == "_score_lasttok"]
-        if not (_lt_prompt_scored(calls) and lt == [["B", "A"]]
-                and all(s for _, _, s in calls)):
-            bad.append("interval=1 arrive=%d" % arrive)
+        want = [("lt", ["B"], ["A"], True),
+                ("ema", ["B"], ["A"], True),
+                ("gru", ["B"], ["A"], True)]
+        if calls != want:
+            bad.append("interval=1 arrive=%d -> %r" % (arrive, calls))
     for arrive in range(1, 11):         # cadence 10: only step 10 scores decode
         calls = _dispatch(10, arrive)
         hit = arrive % 10 == 0
-        dec = [(n, rids, s) for n, rids, s in calls if n.endswith("_decode")]
-        if not (_lt_prompt_scored(calls)
-                and any(n == "_ema_prefill" and "B" in rids
-                        for n, rids, _ in calls)
-                and len(dec) == 2
-                and all(rids == ["A"] and s == hit for _, rids, s in dec)):
-            bad.append("interval=10 arrive=%d" % arrive)
+        want = [("lt", ["B"], ["A"], hit),
+                ("ema", ["B"], ["A"], hit),
+                ("gru", ["B"], ["A"], hit)]
+        if calls != want:
+            bad.append("interval=10 arrive=%d -> %r" % (arrive, calls))
     for b in bad:
         print("FAIL", b)
 

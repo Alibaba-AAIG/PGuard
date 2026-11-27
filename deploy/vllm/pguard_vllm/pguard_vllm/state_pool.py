@@ -16,12 +16,13 @@
 #
 # In-module self-test: python3 -m pguard_vllm.state_pool
 
-import os
 from collections import deque
 
 import torch
 
-_MAX_SLOTS = int(os.environ.get("PGUARD_MAX_SLOTS", "64"))
+from .pguard_config import get_config
+
+_MAX_SLOTS = get_config().max_slots
 
 
 class StatePool:
