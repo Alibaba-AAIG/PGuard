@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # PGuard vLLM 服务烟雾测试
-# 用法: bash pguard_smoke_test.sh [端口]
+# 用法: bash tests/pguard_smoke_test.sh [端口]
 set -u
 PORT="${1:-13553}"
 BASE="http://127.0.0.1:$PORT"

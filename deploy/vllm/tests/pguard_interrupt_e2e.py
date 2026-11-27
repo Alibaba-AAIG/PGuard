@@ -1,7 +1,7 @@
 """Streaming-interrupt check on the live guard service: a prompt-side hit must
 stop the stream before any content chunk comes out, on every trial.
 
-Usage: python3 pguard_interrupt_e2e.py [BASE] [TRIALS]
+Usage: python3 tests/pguard_interrupt_e2e.py [BASE] [TRIALS]
 """
 import json
 import sys

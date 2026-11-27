@@ -107,17 +107,17 @@ python3 -m pguard_vllm.server --self-test   # streaming interrupt check
 python3 -m pguard_vllm.heads        # needs PGUARD_PW_DIR pointing at checkpoints
 
 # end-to-end verdict cases
-bash pguard_smoke_test.sh 13553
+bash tests/pguard_smoke_test.sh 13553
 
 # streaming interruption: risky prompts stop with zero content chunks,
 # benign prompts finish normally
-python3 pguard_interrupt_e2e.py http://127.0.0.1:13553 10
+python3 tests/pguard_interrupt_e2e.py http://127.0.0.1:13553 10
 
 # late-arriving prompts keep their prompt-side scores under scoring cadence
-python3 pguard_cadence_e2e.py http://127.0.0.1:13553 16
+python3 tests/pguard_cadence_e2e.py http://127.0.0.1:13553 16
 
 # concurrency benchmark
-python3 bench_guard.py http://127.0.0.1:13553 8
+python3 tests/bench_guard.py http://127.0.0.1:13553 8
 ```
 
 ## Known limitations

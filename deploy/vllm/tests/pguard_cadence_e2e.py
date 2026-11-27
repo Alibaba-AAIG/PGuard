@@ -4,7 +4,7 @@ A long streaming request keeps decoding; shorter requests join while it runs.
 Every late joiner must still carry its prompt-side Lasttok score, and only a
 fraction of each request's output tokens may be scored.
 
-Usage: python3 pguard_cadence_e2e.py [BASE] [N_JOINERS] [GAP_SECONDS]
+Usage: python3 tests/pguard_cadence_e2e.py [BASE] [N_JOINERS] [GAP_SECONDS]
 The store snapshot reads the guard container (PGUARD_CONTAINER,
 default pguard-vllm-guard) with docker exec.
 """
