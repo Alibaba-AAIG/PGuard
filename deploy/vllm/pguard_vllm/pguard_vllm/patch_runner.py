@@ -29,14 +29,16 @@ import logging
 import os
 
 from .pguard_config import get_config
-from .vllm_compat import (decode_flags, finished_ids, forget_prompt_lens,
-                          resolve_aux, resolve_runner_classes,
-                          runner_class_paths, scheduled_token_counts)
+from .vllm_compat import (current_version, decode_flags, finished_ids,
+                          forget_prompt_lens, profile_for, resolve_aux,
+                          resolve_runner_classes, runner_class_paths,
+                          scheduled_token_counts)
 
 logger = logging.getLogger("pguard_vllm")
 
 _last_aux = None              # aux hidden states from the last forward
 _patched = False
+_PROFILE = None               # CompatProfile resolved at patch time
 _DBG = {"n": 0}
 
 _TRACE = None  # resolved lazily from the config (PGUARD_TRACE)
@@ -69,7 +71,7 @@ def _note_finished(req_ids):
 def _score_after(sched, flags, aux, runner=None):
     if not sched:
         return
-    aux = resolve_aux(runner, aux)
+    aux = resolve_aux(runner, aux, _PROFILE)
     try:
         from .model import _MODEL
         model = _MODEL
@@ -129,14 +131,16 @@ def _make_model_forward_wrapper(orig_model_forward):
 
 
 def _install_patch():
-    global _patched
+    global _patched, _PROFILE
     if _patched:
         return
 
-    resolved, failed = resolve_runner_classes()
+    _PROFILE = profile_for(current_version())
+    resolved, failed = resolve_runner_classes(_PROFILE)
     for path, err in failed:
         _trace("runner import failed: %s: %s" % (path, err))
     targets = [cls for _, cls in resolved]
+    _trace("compat profile: %s" % _PROFILE.name)
 
     aux_mode = get_config().capture_mode == "aux"
     patched_any = False
@@ -187,4 +191,4 @@ def _install_patch():
         raise RuntimeError(
             "pguard_vllm: could not patch any GPUModelRunner candidate "
             "(checked: %s); fix PGUARD_RUNNER_CANDIDATES or the vLLM version"
-            % ", ".join(runner_class_paths()))
+            % ", ".join(runner_class_paths(_PROFILE)))

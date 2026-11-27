@@ -4,11 +4,18 @@
 # GPUModelRunner classes, SchedulerOutput fields, aux hidden-state storage.
 # patch_runner.py (the actual monkey-patching) reads everything from here.
 #
-# Adding a new vLLM version: run `python3 -m pguard_vllm.vllm_compat` in that
-# environment, extend the candidate lists (or PGUARD_RUNNER_CANDIDATES) until
-# the report is green, then run the acceptance flow in tests/README.md.
+# Version-specific knowledge lives in CompatProfile objects held in a
+# registry (vLLM ModelRegistry style): each profile declares the runner
+# candidates and aux storage spots for a range of versions; `profile_for()`
+# picks the longest version-prefix match, falling back to the generic
+# profile. Adding a new vLLM version: run
+# `python3 -m pguard_vllm.vllm_compat` in that environment, register/extend
+# a profile until the report is green, then run the acceptance flow in
+# tests/README.md.
 #
 # In-module self-test / report: python3 -m pguard_vllm.vllm_compat
+
+from dataclasses import dataclass
 
 from .pguard_config import get_config
 
@@ -20,19 +27,83 @@ _BASE_RUNNER_CANDIDATES = (
     "vllm.v1.worker.gpu.model_runner:GPUModelRunner",
 )
 
+# aux hidden-state storage spots, probed in order per step (attribute paths
+# from the runner object).
+_AUX_SPOTS_GENERIC = (
+    ("execute_model_state", "aux_hidden_states"),
+    ("cudagraph_manager", "aux_hidden_states"),
+)
 
-def runner_class_paths() -> list[str]:
-    candidates = list(_BASE_RUNNER_CANDIDATES)
+
+@dataclass(frozen=True)
+class CompatProfile:
+    """Patch assumptions for a range of vLLM versions."""
+
+    name: str
+    version_prefixes: tuple[str, ...]          # "" matches everything
+    runner_candidates: tuple[str, ...]
+    aux_spots: tuple[tuple[str, ...], ...]
+    notes: str = ""
+
+
+_PROFILES: dict[str, CompatProfile] = {}
+
+
+def register_profile(profile: CompatProfile) -> CompatProfile:
+    _PROFILES[profile.name] = profile
+    return profile
+
+
+GENERIC = register_profile(CompatProfile(
+    name="generic",
+    version_prefixes=("",),
+    runner_candidates=_BASE_RUNNER_CANDIDATES,
+    aux_spots=_AUX_SPOTS_GENERIC,
+    notes="legacy runner default; V2 optional",
+))
+
+
+V0_25 = register_profile(CompatProfile(
+    name="v0.25.x",
+    version_prefixes=("0.25.",),
+    runner_candidates=_BASE_RUNNER_CANDIDATES,
+    aux_spots=_AUX_SPOTS_GENERIC,
+    notes="verified baseline",
+))
+
+
+def profile_for(version: str) -> CompatProfile:
+    """Longest registered version-prefix match; GENERIC as fallback."""
+    best = GENERIC
+    best_len = 0
+    for p in _PROFILES.values():
+        for prefix in p.version_prefixes:
+            if prefix and version.startswith(prefix) and len(prefix) > best_len:
+                best, best_len = p, len(prefix)
+    return best
+
+
+def current_version() -> str:
+    try:
+        import vllm
+        return getattr(vllm, "__version__", "unknown")
+    except Exception as e:
+        return "import failed: %r" % (e,)
+
+
+def runner_class_paths(profile: CompatProfile | None = None) -> list[str]:
+    profile = profile or profile_for(current_version())
+    candidates = list(profile.runner_candidates)
     for item in get_config().runner_candidates:
         if item not in candidates:
             candidates.append(item)
     return candidates
 
 
-def resolve_runner_classes():
+def resolve_runner_classes(profile: CompatProfile | None = None):
     """Import every candidate: ([(path, cls)], [(path, error)])."""
     resolved, failed = [], []
-    for path in runner_class_paths():
+    for path in runner_class_paths(profile):
         mod, _, name = path.partition(":")
         try:
             cls = getattr(__import__(mod, fromlist=[name]), name)
@@ -102,23 +173,23 @@ def forget_prompt_lens(req_ids) -> None:
 
 # -- aux hidden states -----------------------------------------------------
 
-def resolve_aux(runner, stash):
-    """Aux hidden states for the step that just ran, probing the known
-    storage spots across runner generations (first non-None wins):
-    1. the _model_forward interceptor's stash (legacy runner)
-    2. runner.execute_model_state.aux_hidden_states (legacy + V2)
-    3. runner.cudagraph_manager.aux_hidden_states (V2 persistent buffers)"""
+def resolve_aux(runner, stash, profile: CompatProfile | None = None):
+    """Aux hidden states for the step that just ran: the _model_forward
+    interceptor's stash first, then the profile's per-runner storage spots
+    (first non-None wins)."""
     if stash is not None:
         return stash
-    if runner is not None:
-        st = getattr(runner, "execute_model_state", None)
-        aux = getattr(st, "aux_hidden_states", None)
-        if aux:
-            return aux
-        gm = getattr(runner, "cudagraph_manager", None)
-        aux = getattr(gm, "aux_hidden_states", None)
-        if aux:
-            return aux
+    if runner is None:
+        return None
+    profile = profile or profile_for(current_version())
+    for path in profile.aux_spots:
+        obj = runner
+        for attr in path:
+            obj = getattr(obj, attr, None)
+            if obj is None:
+                break
+        if obj:
+            return obj
     return None
 
 
@@ -133,11 +204,26 @@ def _field_names(cls) -> set[str]:
     return set(getattr(cls, "__annotations__", {}))
 
 
+def _new_request_data_cls():
+    for name in ("NewRequestData", "ScheduledNewRequestData"):
+        try:
+            from vllm.v1.core.sched import output as sched_output
+            cls = getattr(sched_output, name, None)
+            if cls is not None:
+                return cls
+        except Exception:
+            pass
+    return None
+
+
 def report() -> dict:
     """Everything the patch depends on, resolved against the installed vLLM."""
-    resolved, failed = resolve_runner_classes()
+    version = current_version()
+    profile = profile_for(version)
+    resolved, failed = resolve_runner_classes(profile)
     out: dict = {
-        "vllm_version": _vllm_version(),
+        "vllm_version": version,
+        "profile": profile.name,
         "runner_classes": [p for p, _ in resolved],
         "runner_failures": failed,
         "scheduler_fields": {},
@@ -158,30 +244,11 @@ def report() -> dict:
     return out
 
 
-def _new_request_data_cls():
-    try:
-        from vllm.v1.core.sched.output import NewRequestData
-        return NewRequestData
-    except Exception:
-        try:
-            from vllm.v1.core.sched.output import ScheduledNewRequestData
-            return ScheduledNewRequestData
-        except Exception:
-            return None
-
-
-def _vllm_version() -> str:
-    try:
-        import vllm
-        return getattr(vllm, "__version__", "unknown")
-    except Exception as e:
-        return "import failed: %r" % (e,)
-
-
 def self_check() -> int:
     """0 = the installed vLLM exposes everything the patch needs."""
     rep = report()
     print("vLLM version:      ", rep["vllm_version"])
+    print("compat profile:    ", rep["profile"])
     print("runner classes:    ", rep["runner_classes"] or "NONE")
     for path, err in rep["runner_failures"]:
         print("  unavailable:     ", path, err)

@@ -30,6 +30,17 @@ docker exec pguard-vllm-guard python3 -m pguard_vllm.heads.ema
 docker exec pguard-vllm-guard python3 -m pguard_vllm.heads.gru
 ```
 
+## Multi-version matrix
+
+Run the same acceptance per vLLM version: `tests/versions/` (list in
+`versions.py`, entry point `run_matrix.sh`, results in
+`tests/versions/results/`).
+
+```bash
+bash tests/versions/run_matrix.sh              # all versions in the list
+PULL=1 bash tests/versions/run_matrix.sh 0.26.0   # pull first, then test
+```
+
 ## Upgrade / re-model acceptance flow
 
 After a vLLM upgrade, a backbone swap, or any patch change, run in order and
