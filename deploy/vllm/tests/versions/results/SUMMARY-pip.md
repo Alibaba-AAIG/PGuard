@@ -17,3 +17,8 @@
 | 0.26.0 | smoke | PASS (malicious 0.929, 与基线一致) |
 | 0.26.0 | interrupt | PASS |
 | 0.26.0 | cadence | PASS |
+| 0.27.0 | torch 2.11.0 -> 2.13.0 (cu129 全栈) + torchvision 0.28.0+cu129 + FLASHINFER bypass | 前置 |
+| 0.27.0 | compat | PASS (profile generic) |
+| 0.27.0 | smoke | PASS (malicious 0.928, 与基线一致) |
+| 0.27.0 | interrupt | PASS |
+| 0.27.0 | cadence | PASS |
