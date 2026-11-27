@@ -1,0 +1,56 @@
+# PGuard vLLM guard service (single GPU).
+#
+#   cp .env.example .env   # adjust model path / GPU / heads
+#   docker compose up -d
+#
+# The patch package is live-mounted at /opt/pguard_vllm and installed
+# editable at server start, so patch edits only need a container restart.
+
+services:
+  pguard-vllm-guard:
+    image: ${VLLM_IMAGE:-vllm/vllm-openai:latest-cu129}   # vLLM 0.25.1; matrix tests override via VLLM_IMAGE
+    entrypoint: python3
+    container_name: pguard-vllm-guard
+    restart: unless-stopped
+    ports:
+      - "${PGUARD_PORT:-13553}:8000"
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=${PGUARD_GPU:-0}
+      - PGUARD_HEAD_PATH=/pguard_heads/${PGUARD_HEAD_SUBDIR:-PGuard-EMA-Qwen3.5-9B}
+      - PGUARD_HEADS=${PGUARD_HEADS:-}
+      - PGUARD_THRESHOLD=${PGUARD_THRESHOLD:-0.5}
+      - PGUARD_ENFORCE_EAGER=${PGUARD_ENFORCE_EAGER:-0}
+      - PGUARD_CAPTURE_MODE=${PGUARD_CAPTURE_MODE:-aux}
+      - VLLM_USE_V2_MODEL_RUNNER=${VLLM_USE_V2_MODEL_RUNNER:-1}
+      # scoring cadence: 1.0 = every output token; 0.1 = every 10th
+      - PGUARD_COPY_LOGITS_PROB=${PGUARD_COPY_LOGITS_PROB:-1.0}
+      - PGUARD_SCORE_INTERVAL=${PGUARD_SCORE_INTERVAL:-}
+      - PYTHONPATH=/opt/pguard_vllm
+      # pip version matrix: flashinfer/cubin may mismatch, bypass import check
+      - FLASHINFER_DISABLE_VERSION_CHECK=1
+    volumes:
+      - ${HOST_BACKBONE_DIR:?set HOST_BACKBONE_DIR to the backbone weights}:/models/backbone:ro
+      - ./pguard_heads:/pguard_heads:ro
+      - ./pguard_vllm:/opt/pguard_vllm
+    command: >
+      -m pguard_vllm.server
+      --model /models/backbone
+      --served-model-name pguard-backbone
+      --host 0.0.0.0 --port 8000
+      --max-model-len ${MAX_MODEL_LEN:-8192}
+      --gpu-memory-utilization ${GPU_MEM_UTIL:-0.90}
+      --max-num-seqs 32
+    shm_size: "16gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${PGUARD_GPU:-0}"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 10
+      start_period: 600s

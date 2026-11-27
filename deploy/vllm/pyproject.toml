@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pguard_vllm"
+version = "0.1.0"
+description = "PGuard safety-head integration for vLLM (Qwen3.5 backbones)"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "transformers",
+]
+
+[project.entry-points."vllm.general_plugins"]
+pguard_vllm = "pguard_vllm.plugin:register"
+
+[tool.setuptools.packages.find]
+include = ["pguard_vllm*"]

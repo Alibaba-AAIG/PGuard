@@ -105,3 +105,14 @@ Common:
 | `PGUARD_CFC_NUM_CLASSES` | `4` | Used only when the checkpoint carries no task schema |
 | `PGUARD_CFC_PREFILL_MODE` | `pool` | `pool` or `ema` prompt summarisation |
 | `PGUARD_CFC_PREFILL_EFFECTIVE_LENGTHS` | `200,150,100,50` | EMA window lengths under `ema` |
+
+## vLLM serving
+
+An equivalent serving integration for [vLLM](https://github.com/vllm-project/vllm)
+(tested with v0.25.1) lives in [`vllm/`](vllm/README.md): the same frozen
+backbone + safety-head design, registered through vLLM's
+`vllm.general_plugins` entry point, with CUDA-graph support (EAGLE3-style aux
+capture), OpenAI-compatible chat with `guard_result`, streaming interruption,
+and a standalone moderation endpoint. See
+[`vllm/README.md`](vllm/README.md) for install, serving, configuration and
+benchmark numbers.
