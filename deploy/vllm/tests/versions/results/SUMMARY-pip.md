@@ -34,3 +34,8 @@
 | 0.30.0 | smoke | PASS (malicious 0.939, 与基线数值差 1% 内) |
 | 0.30.0 | interrupt | PASS |
 | 0.30.0 | cadence | PASS |
+| 0.31.0 | 前置：依赖解析装齐（humming-kernels 等）、卸载遗留 torchaudio、flashinfer 家族对齐 0.7.x（jit-cache+sm89 手动装） | 前置 |
+| 0.31.0 | compat | PASS (profile generic) |
+| 0.31.0 | smoke | PASS (malicious 0.936, 与基线数值差 1% 内) |
+| 0.31.0 | interrupt | PASS |
+| 0.31.0 | cadence | PASS |
