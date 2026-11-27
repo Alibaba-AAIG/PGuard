@@ -22,3 +22,7 @@
 | 0.27.0 | smoke | PASS (malicious 0.928, 与基线一致) |
 | 0.27.0 | interrupt | PASS |
 | 0.27.0 | cadence | PASS |
+| 0.28.0 | compat | PASS (profile generic) |
+| 0.28.0 | smoke | PASS (malicious 0.938, 与基线数值差 1% 内) |
+| 0.28.0 | interrupt | PASS |
+| 0.28.0 | cadence | PASS |
