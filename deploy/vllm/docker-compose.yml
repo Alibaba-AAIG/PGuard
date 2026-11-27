@@ -26,6 +26,8 @@ services:
       - PGUARD_COPY_LOGITS_PROB=${PGUARD_COPY_LOGITS_PROB:-1.0}
       - PGUARD_SCORE_INTERVAL=${PGUARD_SCORE_INTERVAL:-}
       - PYTHONPATH=/opt/pguard_vllm
+      # pip version matrix: flashinfer/cubin may mismatch, bypass import check
+      - FLASHINFER_DISABLE_VERSION_CHECK=1
     volumes:
       - ${HOST_BACKBONE_DIR:?set HOST_BACKBONE_DIR to the backbone weights}:/models/backbone:ro
       - ./pguard_heads:/pguard_heads:ro

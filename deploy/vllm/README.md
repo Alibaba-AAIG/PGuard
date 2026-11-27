@@ -125,6 +125,7 @@ python3 tests/bench_guard.py http://127.0.0.1:13553 8
 | Version | Status |
 |---|---|
 | v0.25.1 | verified (eager + CUDA graph, 3 heads, multimodal) |
+| v0.26.0 | verified via pip matrix (FLASHINFER_DISABLE_VERSION_CHECK=1, set in compose) |
 | v0.34.0 | design-time source check (runner / SchedulerOutput fields match) |
 | others  | run `python3 -m pguard_vllm.vllm_compat` in the target env, extend `PGUARD_RUNNER_CANDIDATES` / `vllm_compat.py` until green, then run the acceptance flow |
 
