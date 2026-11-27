@@ -39,3 +39,8 @@
 | 0.31.0 | smoke | PASS (malicious 0.936, 与基线数值差 1% 内) |
 | 0.31.0 | interrupt | PASS |
 | 0.31.0 | cadence | PASS |
+| 0.32.0 | 前置：humming-kernels 0.1.20、flashinfer-python 0.7.6 + jit-cache 0.7.6+cu129 (sm89)、卸载遗留 torchaudio（镜像 commit 方式绕开 crash 循环） | 前置 |
+| 0.32.0 | compat | PASS (profile generic) |
+| 0.32.0 | smoke | PASS (malicious 0.939, 与基线数值差 1% 内) |
+| 0.32.0 | interrupt | PASS |
+| 0.32.0 | cadence | PASS |
