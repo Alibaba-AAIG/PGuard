@@ -13,6 +13,7 @@
 #   VLLM_ENABLE_V1_MULTIPROCESSING=0   (forced here; guard store lives in-process)
 
 import argparse
+import base64
 import inspect
 import json
 import logging
@@ -64,6 +65,53 @@ def _encode_messages(messages, add_generation_prompt: bool,
     if isinstance(encoded, list) and encoded and isinstance(encoded[0], (list, tuple)):
         encoded = encoded[0]                 # batched -> first (only) row
     return [int(t) for t in encoded]
+
+
+def _extract_images(messages) -> list:
+    """Collect images from OpenAI-style content parts, in prompt order.
+
+    Supports {"type": "image_url", "image_url": {"url": ...}} with data:
+    URLs (base64) and http(s) URLs. Raises ValueError on anything
+    unsupported so the caller can answer 400 instead of guessing."""
+    import io
+
+    import requests
+    from PIL import Image
+
+    images = []
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") != "image_url":
+                continue
+            url = (part.get("image_url") or {}).get("url", "")
+            if url.startswith("data:"):
+                _, _, b64 = url.partition(",")
+                img = Image.open(io.BytesIO(base64.b64decode(b64)))
+            elif url.startswith("http://") or url.startswith("https://"):
+                resp = requests.get(url, timeout=30)
+                resp.raise_for_status()
+                img = Image.open(io.BytesIO(resp.content))
+            else:
+                raise ValueError(f"unsupported image url: {url[:60]}")
+            images.append(img.convert("RGB"))
+    return images
+
+
+def _build_prompt(prompt_ids: list[int], images: list) -> dict:
+    """Engine prompt dict; attaches multi_modal_data when images exist.
+
+    The chat template already emitted the vision placeholder tokens; vLLM's
+    mm processor expands them against the actual images. The guard captures
+    per-token hidden states after vision/text fusion, so no engine-side
+    change is needed for multimodal scoring (same as the official GLM4V
+    integration)."""
+    prompt = {"prompt_token_ids": prompt_ids}
+    if images:
+        prompt["multi_modal_data"] = {"image": images}
+    return prompt
 
 
 def build_guard_result(req_id: str, include_series: bool = False,
@@ -230,6 +278,10 @@ async def chat_completions(request: Request):
 
     prompt_ids = _encode_messages(messages, add_generation_prompt=True,
                                   extra_kwargs=body.get("chat_template_kwargs"))
+    try:
+        prompt = _build_prompt(prompt_ids, _extract_images(messages))
+    except Exception as e:
+        return JSONResponse({"error": f"bad image input: {e}"}, status_code=400)
     sampling = SamplingParams(
         temperature=float(body.get("temperature", 0.7)),
         top_p=float(body.get("top_p", 1.0)),
@@ -242,8 +294,7 @@ async def chat_completions(request: Request):
 
     if not stream:
         final = None
-        async for out in STATE["engine"].generate(
-                {"prompt_token_ids": prompt_ids}, sampling, req_id):
+        async for out in STATE["engine"].generate(prompt, sampling, req_id):
             final = out
         text = final.outputs[0].text if final else ""
         resp = {
@@ -269,8 +320,7 @@ async def chat_completions(request: Request):
         last_out = None
         store = get_store()
         try:
-            async for out in STATE["engine"].generate(
-                    {"prompt_token_ids": prompt_ids}, sampling, req_id):
+            async for out in STATE["engine"].generate(prompt, sampling, req_id):
                 last_out = out
                 # streaming guard: stop as soon as a category crosses the line
                 if interrupt and aborted is None:
@@ -343,11 +393,14 @@ async def guard_score(request: Request):
         marked.append({"role": "assistant", "content": ""})
 
     prompt_ids = _encode_messages(marked, add_generation_prompt=False)
+    try:
+        prompt = _build_prompt(prompt_ids, _extract_images(messages))
+    except Exception as e:
+        return JSONResponse({"error": f"bad image input: {e}"}, status_code=400)
     req_id = f"pguard-{uuid.uuid4().hex}"
     sampling = SamplingParams(temperature=0.0, max_tokens=1)
 
-    async for _ in STATE["engine"].generate(
-            {"prompt_token_ids": prompt_ids}, sampling, req_id):
+    async for _ in STATE["engine"].generate(prompt, sampling, req_id):
         pass
 
     result = build_guard_result(req_id, include_series=return_series,
@@ -523,6 +576,8 @@ def main():
             "graph (replay never runs Python hooks -> stale features). Set "
             "PGUARD_ENFORCE_EAGER=1, or use PGUARD_CAPTURE_MODE=aux for "
             "graph mode.")
+    # multimodal: OpenAI-style image content parts, N images per prompt
+    engine_args.limit_mm_per_prompt = {"image": get_config().mm_image_limit}
     overrides = dict(engine_args.hf_overrides or {})
     overrides.update({"architectures": ["Qwen3_5PGuardForConditionalGeneration"]})
     engine_args.hf_overrides = overrides

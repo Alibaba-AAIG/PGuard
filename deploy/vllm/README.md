@@ -133,4 +133,8 @@ python3 bench_guard.py http://127.0.0.1:13553 8
    `response_scores_max` covers scored tokens only, and a response-side
    streaming interrupt can trail by up to N-1 tokens (the prompt side is
    unaffected).
-6. Text input verified; multimodal inputs are not covered yet.
+6. Multimodal image input is supported via OpenAI content parts (`text` +
+   `image_url`, data: base64 or http(s) URLs; `PGUARD_MM_LIMIT` caps images
+   per prompt, default 4). The guard scores the fused vision/text hidden
+   states per token, same as the official GLM4V integration. Audio/video
+   inputs are not covered.

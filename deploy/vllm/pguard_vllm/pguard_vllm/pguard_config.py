@@ -36,6 +36,7 @@ class PGuardConfig:
     fuse_ops: bool
     enforce_eager: bool
     cfc_prefill_mode: str | None     # GRU head prefill summarization override
+    mm_image_limit: int              # max images per prompt (multimodal)
     # API layer
     threshold: float
     verbose: bool
@@ -100,6 +101,7 @@ def _parse_config() -> PGuardConfig:
         fuse_ops=os.environ.get("PGUARD_FUSE_OPS", "1") != "0",
         enforce_eager=os.environ.get("PGUARD_ENFORCE_EAGER", "1") == "1",
         cfc_prefill_mode=cfc_mode,
+        mm_image_limit=max(1, int(os.environ.get("PGUARD_MM_LIMIT", "4"))),
         threshold=float(os.environ.get("PGUARD_THRESHOLD", "0.5")),
         verbose=bool(int(os.environ.get("PGUARD_VERBOSE", "0"))),
         debug=bool(int(os.environ.get("PGUARD_DEBUG", "0"))),
@@ -169,6 +171,9 @@ if __name__ == "__main__":
         ({}, "threshold", 0.5),
         ({"PGUARD_INTERRUPT": "1"}, "interrupt", True),
         ({}, "interrupt", False),
+        ({"PGUARD_MM_LIMIT": "8"}, "mm_image_limit", 8),
+        ({}, "mm_image_limit", 4),
+        ({"PGUARD_MM_LIMIT": "0"}, "mm_image_limit", 1),   # clamped to >= 1
     ]
     bad = []
     _saved = {k: v for k, v in os.environ.items() if k.startswith("PGUARD_")}
