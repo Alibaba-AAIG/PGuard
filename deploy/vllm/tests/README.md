@@ -18,6 +18,7 @@ Prerequisite: `curl http://127.0.0.1:13553/health` returns `{"status":"ok"}`.
 ## Module self-tests (in-container, no HTTP)
 
 ```bash
+docker exec pguard-vllm-guard python3 -m pguard_vllm.vllm_compat
 docker exec pguard-vllm-guard python3 -m pguard_vllm.pguard_config
 docker exec pguard-vllm-guard python3 -m pguard_vllm.store
 docker exec pguard-vllm-guard python3 -m pguard_vllm.state_pool
@@ -34,6 +35,9 @@ docker exec pguard-vllm-guard python3 -m pguard_vllm.heads.gru
 After a vLLM upgrade, a backbone swap, or any patch change, run in order and
 stop on the first failure:
 
+0. in the TARGET environment: `python3 -m pguard_vllm.vllm_compat` — the
+   patch-dependency report must be green (extend `PGUARD_RUNNER_CANDIDATES`
+   / `vllm_compat.py` otherwise)
 1. module self-tests (all green)
 2. start the service, wait for healthy
 3. `pguard_smoke_test.sh` — verdicts must match the baseline

@@ -120,6 +120,19 @@ python3 tests/pguard_cadence_e2e.py http://127.0.0.1:13553 16
 python3 tests/bench_guard.py http://127.0.0.1:13553 8
 ```
 
+## vLLM version compat
+
+| Version | Status |
+|---|---|
+| v0.25.1 | verified (eager + CUDA graph, 3 heads, multimodal) |
+| v0.34.0 | design-time source check (runner / SchedulerOutput fields match) |
+| others  | run `python3 -m pguard_vllm.vllm_compat` in the target env, extend `PGUARD_RUNNER_CANDIDATES` / `vllm_compat.py` until green, then run the acceptance flow |
+
+Runner classes, `SchedulerOutput` fields and aux hidden-state storage are
+probed in one place (`pguard_vllm/vllm_compat.py`); `python3 -m
+pguard_vllm.vllm_compat` prints the report and exits non-zero if the patch
+cannot attach.
+
 ## Known limitations
 
 1. Speculative decoding is not supported (conflicts with per-request scoring).
