@@ -56,3 +56,7 @@
 | 0.22.0 | smoke | PASS (malicious 0.938, 与基线数值差 1% 内) |
 | 0.22.0 | interrupt | PASS |
 | 0.22.0 | cadence | PASS |
+| 0.21.0 | compat | PASS (profile generic；补装 gguf) |
+| 0.21.0 | smoke | PASS (malicious 0.934, 与基线数值差 1% 内) |
+| 0.21.0 | interrupt | PASS |
+| 0.21.0 | cadence | PASS |
