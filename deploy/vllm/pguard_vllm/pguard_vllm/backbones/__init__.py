@@ -16,12 +16,16 @@ import logging
 
 from .base import BackboneAdapter, BackboneRegistry, make_pguard_class
 from .qwen3_5 import Qwen3_5Adapter, Qwen3_5PGuardForConditionalGeneration
+from .deepseek_v4 import DeepseekV4Adapter, DeepseekV4PGuardForCausalLM
+from .glm4v_moe import Glm4vMoeAdapter, Glm4vMoePGuardForConditionalGeneration
 
 logger = logging.getLogger("pguard_vllm")
 
 __all__ = [
     "BackboneAdapter", "BackboneRegistry", "make_pguard_class",
     "Qwen3_5Adapter", "Qwen3_5PGuardForConditionalGeneration",
+    "DeepseekV4Adapter", "DeepseekV4PGuardForCausalLM",
+    "Glm4vMoeAdapter", "Glm4vMoePGuardForConditionalGeneration",
     "default_backbone",
 ]
 

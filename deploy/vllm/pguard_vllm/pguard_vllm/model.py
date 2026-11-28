@@ -40,7 +40,7 @@
 # EngineCore runs in its own process; per-request score series are handed to
 # the API process through the file-backed GuardStore (see store.py).
 #
-# Hot-path notes (see PGuard-Triton优化规划.md):
+# Hot-path notes (see docs/PGuard-Triton优化规划.md):
 #   - capture layers resolve like the official deploy package:
 #     PGUARD_CAPTURE_LAYERS env > config pguard_capture_layers >
 #     selected_layers > feature_layers (the old order mis-fed the Lasttok

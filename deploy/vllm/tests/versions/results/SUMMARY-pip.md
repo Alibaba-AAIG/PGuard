@@ -61,3 +61,6 @@
 | 0.21.0 | interrupt | PASS |
 | 0.21.0 | cadence | PASS |
 | 0.20.0 | 引擎初始化 | 不支持（框架级：Qwen3.5 混合注意力 kv_cache_spec 非 AttentionSpec，_reshape_kv_cache assert 失败；纯主干同样失败，与补丁无关） |
+| DeepSeek-V4 adapter | 注册 + 服务 healthy 回归 PASS（0.25.1，三架构注册） |
+| DeepSeek-V4 adapter | tiny 启动验证 | 阻塞（transformers 5.13/5.17 与 vLLM 0.32 的 DSv4 config 契约漂移：layer_types 白名单、compress_ratios 形态、hc_head 权重名互不兼容；adapter 侧已就位，待上游对齐后重试） |
+| GLM-4V-MoE adapter | 注册 + 服务 healthy 回归 PASS（0.25.1，三架构注册） |
