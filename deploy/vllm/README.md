@@ -124,11 +124,20 @@ python3 tests/bench_guard.py http://127.0.0.1:13553 8
 
 | Version | Status |
 |---|---|
-| v0.23.0 | verified via pip matrix (verdicts match baseline) |
-| v0.25.1 | verified (eager + CUDA graph, 3 heads, multimodal) |
-| v0.26.0 | verified via pip matrix (FLASHINFER_DISABLE_VERSION_CHECK=1, set in compose) |
-| v0.27.0 | verified via pip matrix; torch pin moved 2.11.0->2.13.0, full cu129 stack swap + torchvision 0.28.0+cu129 |
-| v0.34.0 | design-time source check (runner / SchedulerOutput fields match) |
+| v0.20.0 and below | ❌ not supported (vLLM framework limitation: Qwen3.5 hybrid-attention kv_cache_spec is only unified in v0.21.0; engine cannot initialize, unrelated to this patch) |
+| v0.21.0 | ✅ verified, starts and serves guard inference normally |
+| v0.22.0 | ✅ verified, starts and serves guard inference normally |
+| v0.23.0 | ✅ verified, starts and serves guard inference normally |
+| v0.24.0 | ✅ verified, starts and serves guard inference normally |
+| v0.25.1 | ✅ verified (acceptance baseline: eager + CUDA graph, 3 heads, multimodal) |
+| v0.26.0 | ✅ verified, starts and serves guard inference normally (needs `FLASHINFER_DISABLE_VERSION_CHECK=1`, set in compose) |
+| v0.27.0 | ✅ verified, starts and serves guard inference normally (torch stack swap to 2.13.0) |
+| v0.28.0 | ✅ verified, starts and serves guard inference normally |
+| v0.29.0 | ✅ verified, starts and serves guard inference normally |
+| v0.30.0 | ✅ verified, starts and serves guard inference normally |
+| v0.31.0 | ✅ verified, starts and serves guard inference normally |
+| v0.32.0 | ✅ verified, starts and serves guard inference normally |
+| v0.33.0 / v0.34.0 | 🔄 in progress (cu130 wheels only, image-based verification; design-time source check done for v0.34.0) |
 | others  | run `python3 -m pguard_vllm.vllm_compat` in the target env, extend `PGUARD_RUNNER_CANDIDATES` / `vllm_compat.py` until green, then run the acceptance flow |
 
 Runner classes, `SchedulerOutput` fields and aux hidden-state storage are
