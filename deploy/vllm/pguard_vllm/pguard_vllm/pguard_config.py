@@ -43,6 +43,7 @@ class PGuardConfig:
     debug: bool
     interrupt: bool
     # engine patch / diagnostics
+    backbone: str                    # registered backbone name (PGUARD_BACKBONE)
     runner_candidates: tuple[str, ...]   # EXTRA runner candidates (module:Class,...)
     trace_guard: bool
     trace_path: str
@@ -106,6 +107,7 @@ def _parse_config() -> PGuardConfig:
         verbose=bool(int(os.environ.get("PGUARD_VERBOSE", "0"))),
         debug=bool(int(os.environ.get("PGUARD_DEBUG", "0"))),
         interrupt=bool(int(os.environ.get("PGUARD_INTERRUPT", "0"))),
+        backbone=os.environ.get("PGUARD_BACKBONE", "qwen3_5").strip(),
         runner_candidates=_parse_runner_candidates(
             os.environ.get("PGUARD_RUNNER_CANDIDATES", "")),
         trace_guard=os.environ.get("PGUARD_TRACE_GUARD", "") == "1",
@@ -174,6 +176,8 @@ if __name__ == "__main__":
         ({"PGUARD_MM_LIMIT": "8"}, "mm_image_limit", 8),
         ({}, "mm_image_limit", 4),
         ({"PGUARD_MM_LIMIT": "0"}, "mm_image_limit", 1),   # clamped to >= 1
+        ({"PGUARD_BACKBONE": " deepseek_v4 "}, "backbone", "deepseek_v4"),
+        ({}, "backbone", "qwen3_5"),
     ]
     bad = []
     _saved = {k: v for k, v in os.environ.items() if k.startswith("PGUARD_")}

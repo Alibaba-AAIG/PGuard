@@ -1,12 +1,18 @@
-# Custom vLLM model architecture: Qwen3.5 backbone + PGuard safety heads.
+# Guard mixin: backbone-agnostic PGuard scoring engine for vLLM.
 #
-# Registered under a distinct architecture name so the *original* backbone
+# Registered under per-backbone architecture names so the *original* backbone
 # checkpoint loads unchanged; the guard heads come separately from
 # PGUARD_HEADS / PGUARD_HEAD_PATH. Hidden states of the configured backbone
 # layers are captured per step and scored per request using
 # SchedulerOutput.num_scheduled_tokens for batch segmentation, which keeps the
 # integration fully concurrent (no request serialization, no global locks
 # around generation).
+#
+# PGuardMixin carries all guard logic and is backbone-agnostic: the three
+# backbone access points (decoder layers, root module, aux capture) come from
+# a BackboneAdapter (see backbones/base.py). Concrete architecture classes
+# are produced by make_pguard_class(adapter) in the per-backbone adapter
+# modules (backbones/qwen3_5.py, ...) and registered by plugin.py.
 #
 # The safety heads live in the heads/ package (GuardHeadRegistry, vLLM
 # ModelRegistry style): this class only captures features, segments the batch
@@ -57,8 +63,6 @@ import os
 
 import torch
 
-from vllm.model_executor.models.qwen3_5 import Qwen3_5ForConditionalGeneration
-
 from .heads import build_head_from_checkpoint, resolve_head_dtype
 from .pguard_config import get_config
 from .store import get_store, resolve_head_dirs
@@ -97,7 +101,13 @@ def _parse_layers(spec, num_hidden_layers: int) -> list[int]:
     return [int(x) for x in spec]
 
 
-class Qwen3_5PGuardForConditionalGeneration(Qwen3_5ForConditionalGeneration):
+class PGuardMixin:
+    """Backbone-agnostic guard engine (see module docstring).
+
+    Concrete classes are built by backbones.base.make_pguard_class(adapter):
+    type(arch_name, (PGuardMixin, BackboneBase), {"backbone_adapter": adapter})."""
+
+    backbone_adapter = None  # injected by make_pguard_class
 
     def __init__(self, *, vllm_config, prefix="model"):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
@@ -152,7 +162,7 @@ class Qwen3_5PGuardForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             raise RuntimeError("no guard heads configured "
                                "(set PGUARD_HEADS or PGUARD_HEAD_PATH)")
 
-        device = next(self.language_model.model.parameters()).device
+        device = next(self.backbone_adapter.root_module(self).parameters()).device
         head_dtype = resolve_head_dtype(cfg.head_dtype)
         hf_indices = None
         num_layers = None
@@ -196,10 +206,13 @@ class Qwen3_5PGuardForConditionalGeneration(Qwen3_5ForConditionalGeneration):
             # (hidden_states, aux); the runner keeps the buffers fresh across
             # CUDA-graph replays. patch_runner sets
             # use_aux_hidden_state_outputs=True accordingly.
-            self.language_model.set_aux_hidden_state_layers(tuple(hf_indices))
+            if not self.backbone_adapter.enable_aux(self, tuple(hf_indices)):
+                raise RuntimeError(
+                    "backbone %r does not support aux capture; set "
+                    "PGUARD_CAPTURE_MODE=hooks (eager)" % self.backbone_adapter.name)
         else:
             # one hook per union layer; each head reads its own subset
-            layers = self.language_model.model.layers
+            layers = self.backbone_adapter.decoder_layers(self)
             self._capture_module_idx = [i - 1 for i in hf_indices]
             for mi in self._capture_module_idx:
                 layers[mi].register_forward_hook(self._make_hook(mi),
@@ -453,7 +466,7 @@ class Qwen3_5PGuardForConditionalGeneration(Qwen3_5ForConditionalGeneration):
         return flags
 
 
-# populated by Qwen3_5PGuardForConditionalGeneration._setup_pguard
+# populated by PGuardMixin._setup_pguard
 # (kept annotation-free: this module is imported inside vLLM's architecture
 #  inspection subprocess, where every name must already be defined)
 guard_store = None
@@ -483,7 +496,7 @@ if __name__ == "__main__":
             return False
 
     def _dispatch(interval, arrive):
-        m = object.__new__(Qwen3_5PGuardForConditionalGeneration)
+        m = object.__new__(PGuardMixin)
         m._pguard_ready, m._capture_mode, m._cap = True, "aux", {}
         m._capture_module_idx = [0, 1, 2]
         m._score_interval, m._decode_step, m._step_count = interval, 0, 0
@@ -528,7 +541,7 @@ if __name__ == "__main__":
     globals()["guard_store"] = types.SimpleNamespace(
         task_layout=lambda head: ([("t_a", 0, 2), ("t_b", 2, 5)], 5),
         append=lambda *a: None, close_live=lambda *a: None)
-    m = object.__new__(Qwen3_5PGuardForConditionalGeneration)
+    m = object.__new__(PGuardMixin)
     m._live, m._live_dirty = {}, set()
     marks = []                      # store write needed after each step?
     for flat, n, is_dec in [        # top non-normal: 0.3 | 0.3 | 0.4 | 0.3

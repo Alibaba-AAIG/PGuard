@@ -31,6 +31,7 @@ from vllm.engine.arg_utils import AsyncEngineArgs  # noqa: E402
 from vllm.sampling_params import SamplingParams  # noqa: E402
 from vllm.v1.engine.async_llm import AsyncLLM  # noqa: E402
 
+from .backbones import default_backbone
 from .plugin import register as _register_plugin  # noqa: E402
 from .pguard_config import get_config  # noqa: E402
 from .store import GuardStore, get_store  # noqa: E402
@@ -579,7 +580,7 @@ def main():
     # multimodal: OpenAI-style image content parts, N images per prompt
     engine_args.limit_mm_per_prompt = {"image": get_config().mm_image_limit}
     overrides = dict(engine_args.hf_overrides or {})
-    overrides.update({"architectures": ["Qwen3_5PGuardForConditionalGeneration"]})
+    overrides.update({"architectures": [default_backbone().arch_name]})
     engine_args.hf_overrides = overrides
 
     if not args.head_path:
