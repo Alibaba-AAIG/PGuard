@@ -124,6 +124,7 @@ python3 tests/bench_guard.py http://127.0.0.1:13553 8
 
 | Version | Status |
 |---|---|
+| v0.23.0 | verified via pip matrix (verdicts match baseline) |
 | v0.25.1 | verified (eager + CUDA graph, 3 heads, multimodal) |
 | v0.26.0 | verified via pip matrix (FLASHINFER_DISABLE_VERSION_CHECK=1, set in compose) |
 | v0.27.0 | verified via pip matrix; torch pin moved 2.11.0->2.13.0, full cu129 stack swap + torchvision 0.28.0+cu129 |
