@@ -60,3 +60,4 @@
 | 0.21.0 | smoke | PASS (malicious 0.934, 与基线数值差 1% 内) |
 | 0.21.0 | interrupt | PASS |
 | 0.21.0 | cadence | PASS |
+| 0.20.0 | 引擎初始化 | 不支持（框架级：Qwen3.5 混合注意力 kv_cache_spec 非 AttentionSpec，_reshape_kv_cache assert 失败；纯主干同样失败，与补丁无关） |
